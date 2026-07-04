@@ -1,0 +1,98 @@
+#!/usr/bin/env php
+<?php
+
+declare(strict_types=1);
+
+/**
+ * ephpm-wp-worker — WordPress entrypoint for ePHPm persistent worker mode.
+ *
+ * ePHPm launches this script for each persistent worker (point
+ * `[php] worker_script` at it, or at a copy of it inside your project). It:
+ *
+ *   1. locates and loads this package's Composer autoloader,
+ *   2. locates the WordPress root (EPHPM_WP_PATH env var, or ABSPATH if already
+ *      defined, or a walk upward looking for wp-load.php),
+ *   3. boots WordPress ONCE and runs the worker loop via Ephpm\WordPress\Worker.
+ *
+ * Requires `[php] worker_populate_superglobals = true` in ephpm.toml — WordPress
+ * assumes real $_SERVER/$_GET/$_COOKIE superglobals. See the package README.
+ */
+
+use Ephpm\WordPress\Worker;
+use Ephpm\Worker\Runtime;
+
+(static function (array $argv): int {
+    // --- 1. Locate the Composer autoloader (search upward from CWD & script). -
+    $autoload = null;
+    $seeds = [getcwd() ?: __DIR__, __DIR__];
+    foreach ($seeds as $seed) {
+        $dir = $seed;
+        while (true) {
+            $candidate = $dir . DIRECTORY_SEPARATOR . 'vendor' . DIRECTORY_SEPARATOR . 'autoload.php';
+            if (is_file($candidate)) {
+                $autoload = $candidate;
+                break 2;
+            }
+            $parent = dirname($dir);
+            if ($parent === $dir) {
+                break; // reached filesystem root
+            }
+            $dir = $parent;
+        }
+    }
+
+    if ($autoload === null) {
+        fwrite(STDERR, "ephpm-wp-worker: could not locate vendor/autoload.php (run composer install).\n");
+
+        return 1;
+    }
+
+    require $autoload;
+
+    // --- 2. Fail fast if not under ePHPm worker mode. ------------------------
+    Runtime::assertAvailable();
+
+    // --- 3. Locate the WordPress root. ---------------------------------------
+    $absPath = $argv[1] ?? getenv('EPHPM_WP_PATH') ?: null;
+
+    if ($absPath === null && defined('ABSPATH')) {
+        $absPath = ABSPATH;
+    }
+
+    if ($absPath === null) {
+        // Walk upward from CWD looking for wp-load.php.
+        $dir = getcwd() ?: __DIR__;
+        while (true) {
+            if (is_file($dir . DIRECTORY_SEPARATOR . 'wp-load.php')) {
+                $absPath = $dir;
+                break;
+            }
+            $parent = dirname($dir);
+            if ($parent === $dir) {
+                break;
+            }
+            $dir = $parent;
+        }
+    }
+
+    if ($absPath === null) {
+        fwrite(
+            STDERR,
+            "ephpm-wp-worker: could not locate WordPress.\n"
+            . "Set EPHPM_WP_PATH to the WordPress root, or pass it as the first argument.\n"
+        );
+
+        return 1;
+    }
+
+    $absPath = rtrim($absPath, "/\\") . '/';
+
+    if (!is_file($absPath . 'wp-load.php')) {
+        fwrite(STDERR, "ephpm-wp-worker: no wp-load.php under {$absPath}\n");
+
+        return 1;
+    }
+
+    // --- 4. Boot WordPress once and run the worker loop. ---------------------
+    return (new Worker($absPath))->run();
+})($argv);

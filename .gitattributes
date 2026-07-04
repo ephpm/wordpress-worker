@@ -1,0 +1,6 @@
+* text=auto eol=lf
+*.php text eol=lf
+*.sh text eol=lf
+bin/ephpm-wp-worker text eol=lf
+Dockerfile text eol=lf
+*.toml text eol=lf

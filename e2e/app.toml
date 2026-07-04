@@ -1,0 +1,11 @@
+# ephpm config for the WordPress worker-mode e2e image.
+[server]
+listen = "0.0.0.0:8080"
+
+[php]
+mode = "worker"
+worker_script = "worker.php"
+worker_populate_superglobals = true   # REQUIRED for WordPress
+document_root = "/var/www/html"
+worker_count = 2                       # small pool; recycling tested separately
+worker_max_requests = 500
