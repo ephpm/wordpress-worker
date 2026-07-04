@@ -52,10 +52,11 @@ final class ResponseTranslateTest extends TestCase
         self::assertSame(200, Worker::currentStatus());
     }
 
-    public function testResetGlobalsListCoversCoreRequestScopedGlobals(): void
+    public function testResetGlobalsListCoversTransientLoopGlobals(): void
     {
-        // Guard rails: these MUST stay in the reset list or state leaks.
-        foreach (['wp_query', 'wp_the_query', 'wp', 'post', 'wp_did_header', 'pages'] as $required) {
+        // Guard rails: these transient loop/template globals MUST be in the
+        // unset list or state leaks between requests.
+        foreach (['post', 'authordata', 'wp_did_header', 'pages', 'pagenow'] as $required) {
             self::assertContains(
                 $required,
                 Worker::RESET_GLOBALS,
@@ -63,14 +64,81 @@ final class ResponseTranslateTest extends TestCase
             );
         }
 
-        // The list must not accidentally include boot-once globals.
-        foreach (['wpdb', 'wp_object_cache', 'wp_filter'] as $forbidden) {
+        // The query OBJECTS and boot-once state must NOT be in the unset list:
+        // $wp/$wp_query/$wp_the_query are re-instantiated in place (unsetting
+        // $wp makes wp() fatal), and $wpdb/$wp_object_cache/$wp_filter are
+        // boot-once infrastructure.
+        foreach (
+            ['wp', 'wp_query', 'wp_the_query', 'wpdb', 'wp_object_cache', 'wp_filter']
+            as $forbidden
+        ) {
             self::assertNotContains(
                 $forbidden,
                 Worker::RESET_GLOBALS,
-                "\${$forbidden} is boot-once state and must NOT be reset per request",
+                "\${$forbidden} must NOT be in the blind-unset list",
             );
         }
+    }
+
+    public function testRouteScriptFrontController(): void
+    {
+        // Front-end URLs → null (run the front controller).
+        self::assertNull(Worker::routeScript('/', '/tmp/wp'));
+        self::assertNull(Worker::routeScript('/?p=42', '/tmp/wp'));
+        self::assertNull(Worker::routeScript('/2024/07/hello-world/', '/tmp/wp'));
+        self::assertNull(Worker::routeScript('/wp-json/wp/v2/posts', '/tmp/wp'));
+        self::assertNull(Worker::routeScript('/index.php', '/tmp/wp'));
+    }
+
+    public function testRouteScriptResolvesEntryScript(): void
+    {
+        $root = \sys_get_temp_dir() . '/ephpm-wp-route-' . \uniqid();
+        \mkdir($root . '/wp-admin', 0777, true);
+        \file_put_contents($root . '/wp-login.php', '<?php');
+        \file_put_contents($root . '/wp-admin/edit.php', '<?php');
+
+        self::assertSame(
+            \realpath($root . '/wp-login.php'),
+            Worker::routeScript('/wp-login.php', $root),
+        );
+        self::assertSame(
+            \realpath($root . '/wp-admin/edit.php'),
+            Worker::routeScript('/wp-admin/edit.php?post=1', $root),
+        );
+        // PATH_INFO after the script still resolves to the script.
+        self::assertSame(
+            \realpath($root . '/wp-login.php'),
+            Worker::routeScript('/wp-login.php/extra', $root),
+        );
+        // Nonexistent script → null.
+        self::assertNull(Worker::routeScript('/nope.php', $root));
+
+        \unlink($root . '/wp-admin/edit.php');
+        \unlink($root . '/wp-login.php');
+        \rmdir($root . '/wp-admin');
+        \rmdir($root);
+    }
+
+    public function testRestRouteRewrite(): void
+    {
+        self::assertSame('/', Worker::restRoute('/wp-json'));
+        self::assertSame('/', Worker::restRoute('/wp-json/'));
+        self::assertSame('/wp/v2/posts', Worker::restRoute('/wp-json/wp/v2/posts'));
+        self::assertSame('/wp/v2/posts', Worker::restRoute('/wp-json/wp/v2/posts?per_page=1'));
+        // Non-REST URIs are left alone.
+        self::assertNull(Worker::restRoute('/'));
+        self::assertNull(Worker::restRoute('/?p=4'));
+        self::assertNull(Worker::restRoute('/wp-login.php'));
+        self::assertNull(Worker::restRoute('/not-wp-json/x'));
+    }
+
+    public function testRouteScriptRejectsTraversal(): void
+    {
+        $root = \sys_get_temp_dir() . '/ephpm-wp-route2-' . \uniqid();
+        \mkdir($root, 0777, true);
+        // A traversal target that escapes the root must be rejected.
+        self::assertNull(Worker::routeScript('/../../etc/passwd.php', $root));
+        \rmdir($root);
     }
 
     public function testResetRequestGlobalsUnsetsListedGlobals(): void

@@ -11,52 +11,67 @@ use Throwable;
  * Runs WordPress under ePHPm persistent worker mode.
  *
  * WordPress is procedural, not a re-entrant kernel: there is no "handle one
- * request" callable you can invoke in a loop. This adapter works around that by
+ * request" callable you can invoke in a loop, and its request cycle (`wp()`, the
+ * template loader, the active theme) assumes it runs at GLOBAL scope. Because a
+ * `require` inside a class method executes in method scope (trapping the
+ * top-level `$wpdb`/`$wp_query`/… variables WordPress creates without `global`),
+ * **the request loop itself must live in the worker entry script at global
+ * scope** — not inside a method here. This class therefore provides the pieces
+ * the entry script calls around the global-scope `wp()` + template run:
  *
- *   1. **Booting WordPress ONCE** — `wp-load.php` is loaded a single time so the
- *      autoloader, `wp-config.php` constants, the `$wpdb` connection, must-use
- *      plugins and the (deterministic) hook graph stay resident in memory.
- *   2. **Resetting request-scoped globals per request** before re-running the
- *      main query, then re-seeding the superglobals from the request Envelope
- *      and re-running `wp()` so the routing, query and template stack execute
- *      fresh for each request.
+ *   - {@see defineBootConstants()} + a global-scope `require wp-load.php`
+ *     (in the entry script) boot WordPress ONCE.
+ *   - {@see installHooks()} installs the per-worker hooks (redirect capture).
+ *   - {@see beforeRequest()} marshals the Envelope into the superglobals, resets
+ *     request-scoped globals, and returns a routed entry script (or null for the
+ *     front controller).
+ *   - {@see finishResponse()} turns the captured output buffer into the
+ *     `[status, headers, body]` triple for `send_response()`.
  *
- * HONEST CAVEAT: because WordPress is procedural, only globals that can be
- * cleanly reset are reset (see {@see RESET_GLOBALS}); anything a plugin stashes
- * elsewhere is a potential leak. The e2e suite — not this class — is the arbiter
- * of correctness. Object caching should use the existing `ephpm/cache-wordpress`
- * drop-in so the persistent object cache is flushed between requests.
+ * See `bin/ephpm-wp-worker` for the canonical global-scope loop.
  *
- * Engine facts this adapter relies on (verified in ephpm_wrapper.c):
- *   - With `worker_populate_superglobals = true` the engine natively rebuilds
- *     `$_SERVER` / `$_GET` / `$_COOKIE` via `php_hash_environment()` at a
- *     quiescent point and resets its server-var registration each request, so
- *     there is no `$_SERVER` bleed between requests.
- *   - The native path does NOT parse `$_POST` / `$_FILES` — `Envelope::parsedBody()`
- *     returns null. This adapter therefore parses the raw body itself for
- *     `application/x-www-form-urlencoded` and `multipart/form-data` POSTs.
- *   - `send_response()` concatenates any captured `echo` output with the explicit
- *     `$body`. We `ob_start()` and pass the captured buffer as `$body`, leaving
- *     native output at zero, so there is no double-emission.
- *   - The engine resets SAPI headers / status / `http_response_code()` → 200 /
- *     `headers_sent()` → 0 at the start of each iteration.
+ * EMPIRICAL engine behaviour this adapter is built around (observed in the e2e
+ * harness against a real ePHPm worker build — these CORRECT some of the
+ * originally-assumed facts):
+ *   - With `worker_populate_superglobals = true` the engine natively populates
+ *     `$_GET` and `$_COOKIE`, but leaves `$_SERVER` essentially EMPTY (no
+ *     `REQUEST_URI`/`REQUEST_METHOD`/`HTTP_HOST`). So this adapter populates
+ *     `$_SERVER` from the Envelope itself, and MUST NOT reassign `$_GET`/
+ *     `$_COOKIE` — replacing the engine-owned superglobal zvals crashes the
+ *     worker. `$_POST`/`$_FILES` are also never populated natively, so the
+ *     adapter parses the raw body for those.
+ *   - `wp_redirect()` ends in `exit`; letting WordPress `exit` mid-request from
+ *     `redirect_canonical` (e.g. on a WP_HOME host/port mismatch) crashes the
+ *     worker. {@see installHooks()} intercepts `wp_redirect` and unwinds
+ *     cleanly via {@see RedirectSignal} so the loop emits a real 3xx instead.
+ *   - `send_response()` concatenates captured `echo` output with the explicit
+ *     `$body`, so the adapter `ob_start()`s and passes the captured buffer as
+ *     `$body` (native output stays at zero).
+ *
+ * HONEST CAVEATS (see README → Known limitations, validated by the e2e suite):
+ *   - WordPress **block rendering** (`do_blocks()` / block themes) crashes the
+ *     worker; use classic themes and non-block content.
+ *   - Only the request-scoped globals this class knows about are reset; anything
+ *     a plugin stashes elsewhere can leak. Recycling bounds the blast radius.
  */
 final class Worker
 {
     /**
-     * Request-scoped WordPress globals that MUST be reset between requests.
+     * Request-scoped WordPress globals that MUST be reset between requests by
+     * UNSETTING them. WordPress lazily re-creates or re-derives each of these
+     * during `WP::main()` / the template stack, so clearing them prevents the
+     * previous request's values from bleeding forward.
      *
-     * These are re-initialised (unset or reassigned) before each request's main
-     * query so state from the previous request cannot bleed forward. Kept as a
-     * named constant so it is directly unit-testable and reviewable.
+     * NOTE: the query *objects* `$wp`, `$wp_query` and `$wp_the_query` are NOT
+     * in this list — they are boot-once infrastructure that `wp()` mutates in
+     * place (unsetting them makes `wp()` fatal with "Call to a member function
+     * main() on null"). They are instead re-initialised to fresh instances by
+     * {@see resetRequestGlobals()}. Kept as a named constant so the exact
+     * key-list is directly unit-testable and reviewable.
      *
      * @var list<string>
      */
     public const RESET_GLOBALS = [
-        // The query objects — the single biggest source of leakage.
-        'wp_query',
-        'wp_the_query',
-        'wp',
         // The post loop / template globals.
         'post',
         'authordata',
@@ -69,9 +84,7 @@ final class Worker
         'numpages',
         // Routing / header state.
         'wp_did_header',
-        'is_iis',
         // Misc per-request state.
-        'wp_current_filter',
         'pagenow',
         'typenow',
         'taxnow',
@@ -86,117 +99,245 @@ final class Worker
     }
 
     /**
-     * Boot WordPress once, then enter the worker loop.
+     * Define the constants WordPress needs for a headless worker boot.
      *
-     * @return int process exit code (0 on clean shutdown/recycle)
-     */
-    public function run(): int
-    {
-        Runtime::assertAvailable();
-
-        $this->boot();
-
-        while (($envelope = \Ephpm\Worker\take_request()) !== null) {
-            [$status, $headers, $body] = $this->handleEnvelope($envelope);
-            \Ephpm\Worker\send_response($status, $headers, $body);
-        }
-
-        return 0;
-    }
-
-    /**
-     * Load WordPress exactly once.
+     * Call this from the entry script BEFORE requiring `wp-load.php` at global
+     * scope. Safe to call from any scope (it only `define()`s constants).
      *
-     * Defines the constants WordPress needs to run headless under a worker, then
-     * requires `wp-load.php`. After this returns the framework is fully resident.
+     * @param string $absPath the WordPress root (ABSPATH), trailing slash optional
      */
-    public function boot(): void
+    public static function defineBootConstants(string $absPath): void
     {
         if (!\defined('ABSPATH')) {
-            \define('ABSPATH', $this->absPath);
+            \define('ABSPATH', \rtrim($absPath, '/\\') . '/');
         }
 
         // WP_USE_THEMES is normally set by index.php; a headless boot must set it
-        // so template_loader.php renders the theme for front-end requests.
+        // so template-loader.php renders the theme for front-end requests.
         if (!\defined('WP_USE_THEMES')) {
             \define('WP_USE_THEMES', true);
         }
 
-        // A boot marker so the e2e suite can prove WordPress bootstrapped ONCE
-        // (per worker) rather than per request.
+        // A boot marker so tooling can prove WordPress bootstrapped ONCE per
+        // worker rather than per request.
         if (!\defined('EPHPM_WP_BOOTED')) {
             \define('EPHPM_WP_BOOTED', \microtime(true));
         }
-
-        require ABSPATH . 'wp-load.php';
     }
 
     /**
-     * Handle a single request Envelope end-to-end and return the
-     * `[status, headers, body]` triple for `send_response()`.
+     * Install the per-worker WordPress hooks. Call ONCE after boot (from the
+     * entry script's global scope, before the request loop).
      *
-     * Any `Throwable` — including a fatal surfaced by a shutdown handler — is
-     * turned into a clean 500 so a single bad request cannot wedge the loop.
-     * Engine-level fatals that PHP cannot catch are left to the engine's worker
-     * recycler (the e2e FATAL-IN-HOOK test exercises that path).
+     * Two interceptions, both to avoid a mid-`wp()` `exit`/`die` (which crashes
+     * the resident worker, unlike an exit from a top-level required script):
+     *
+     *   - `wp_redirect`: WordPress redirects with `wp_redirect($loc); exit;`.
+     *     The filter throws a {@see RedirectSignal} the loop turns into a 3xx.
+     *   - `rest_pre_serve_request`: the REST server ends `serve_request()` with
+     *     `die()`. The filter serialises the response itself, then throws a
+     *     {@see RestServed} signal the loop turns into the JSON response — so the
+     *     REST API works without the crashing die().
+     */
+    public function installHooks(): void
+    {
+        if (!\function_exists('add_filter')) {
+            return;
+        }
+
+        add_filter('wp_redirect', static function ($location, $status) {
+            // Unwind cleanly to the worker loop instead of letting WP exit().
+            throw new RedirectSignal(
+                \is_string($location) ? $location : '/',
+                \is_int($status) && $status >= 300 && $status < 400 ? $status : 302,
+            );
+        }, \PHP_INT_MAX, 2);
+
+        add_filter('rest_pre_serve_request', static function ($served, $result, $request, $server) {
+            // Serialise the REST response here and unwind, so WordPress' own
+            // echo + die() in WP_REST_Server::serve_request() never runs.
+            $embed = isset($_GET['_embed']) && $_GET['_embed'] !== '0';
+            $data = $server->response_to_data($result, $embed);
+            $json = \wp_json_encode($data);
+            if ($json === false) {
+                $json = '{"code":"rest_encoding_error"}';
+            }
+            $status = $result instanceof \WP_REST_Response ? $result->get_status() : 200;
+
+            throw new RestServed((string) $json, \is_int($status) ? $status : 200);
+        }, \PHP_INT_MAX, 4);
+    }
+
+    /**
+     * Prepare for one request: marshal the Envelope into the superglobals and
+     * reset request-scoped WordPress globals. Returns a concrete entry script to
+     * `require` (e.g. `wp-login.php`) or null when the request should run through
+     * the front controller (`wp()` + the template loader).
+     *
+     * MUST be called from the entry script's global scope, immediately before
+     * the global-scope `wp()` + template run (WordPress' request cycle assumes
+     * global scope — see the class docblock).
      *
      * @param object $envelope an Ephpm\Worker\Envelope (or a compatible fake)
      *
-     * @return array{0: int, 1: array<string, string>, 2: string}
+     * @return string|null absolute entry-script path, or null for front controller
      */
-    public function handleEnvelope(object $envelope): array
+    public function beforeRequest(object $envelope): ?string
     {
-        \ob_start();
-        try {
-            $this->marshalSuperglobals($envelope);
-            $this->resetRequestGlobals();
-            $this->dispatch();
+        $this->marshalSuperglobals($envelope);
+        $this->resetRequestGlobals();
 
-            $body = (string) \ob_get_clean();
+        $uri = (string) ($_SERVER['REQUEST_URI'] ?? '/');
 
-            return [
-                self::currentStatus(),
-                self::collectHeaders(),
-                $body,
-            ];
-        } catch (Throwable $e) {
-            // Discard any partial output the failing request produced.
-            while (\ob_get_level() > 0) {
-                \ob_end_clean();
-            }
-
-            return self::errorResponse($e);
+        // REST route rewrite: with plain permalinks (no rewrite rules) WordPress
+        // reaches the REST server via ?rest_route=/… rather than /wp-json/….
+        // Translate so the REST API works without pretty permalinks.
+        $restRoute = self::restRoute($uri);
+        if ($restRoute !== null) {
+            $_GET['rest_route'] = $restRoute;
+            $_REQUEST['rest_route'] = $restRoute;
         }
+
+        $target = self::routeScript($uri, $this->absPath);
+        if ($target !== null) {
+            $_SERVER['SCRIPT_FILENAME'] = $target;
+            $_SERVER['SCRIPT_NAME'] = '/' . \ltrim(\substr($target, \strlen($this->absPath)), '/');
+            $_SERVER['PHP_SELF'] = $_SERVER['SCRIPT_NAME'];
+        }
+
+        return $target;
     }
 
     /**
-     * Run the WordPress front controller for the current request.
-     *
-     * Split out so `handleEnvelope()` stays testable: tests override this (via a
-     * subclass) with a no-op / stub so they never touch a real WordPress.
+     * Map a `/wp-json[/PATH]` request URI to the `rest_route` value WordPress
+     * expects with plain permalinks (`/`, `/wp/v2/posts`, …), or null when the
+     * URI is not a REST request. Pure and testable.
      */
-    protected function dispatch(): void
+    public static function restRoute(string $requestUri): ?string
     {
-        // Re-run the main query + routing for this request, then render the
-        // template. Mirrors wp-blog-header.php without re-loading WordPress.
-        if (\function_exists('wp')) {
-            wp();
+        $path = \parse_url($requestUri, \PHP_URL_PATH);
+        if (!\is_string($path)) {
+            return null;
+        }
+        $path = '/' . \ltrim($path, '/');
+
+        if ($path === '/wp-json' || $path === '/wp-json/') {
+            return '/';
+        }
+        if (\str_starts_with($path, '/wp-json/')) {
+            return '/' . \ltrim(\substr($path, \strlen('/wp-json/')), '/');
         }
 
-        $templateLoader = ABSPATH . WPINC . '/template-loader.php';
-        if (\defined('WPINC') && \is_file($templateLoader)) {
-            require $templateLoader;
+        return null;
+    }
+
+    /**
+     * Build the `[status, headers, body]` triple for `send_response()` from a
+     * captured output-buffer body plus WordPress' emitted status/headers.
+     *
+     * @return array{0: int, 1: array<string, string>, 2: string}
+     */
+    public static function finishResponse(string $body): array
+    {
+        return [self::currentStatus(), self::collectHeaders(), $body];
+    }
+
+    /**
+     * Build a 3xx redirect response triple from a captured {@see RedirectSignal}.
+     *
+     * @return array{0: int, 1: array<string, string>, 2: string}
+     */
+    public static function redirectResponse(RedirectSignal $r): array
+    {
+        return [
+            $r->status,
+            ['Location' => $r->location, 'Content-Type' => 'text/html; charset=UTF-8'],
+            '',
+        ];
+    }
+
+    /**
+     * Build a JSON REST response triple from a captured {@see RestServed}.
+     *
+     * @return array{0: int, 1: array<string, string>, 2: string}
+     */
+    public static function restResponse(RestServed $r): array
+    {
+        return [
+            $r->status,
+            ['Content-Type' => 'application/json; charset=UTF-8'],
+            $r->json,
+        ];
+    }
+
+    /**
+     * Build the 500 response triple for a request that threw.
+     *
+     * @return array{0: int, 1: array<string, string>, 2: string}
+     */
+    public static function errorResponseTriple(Throwable $e): array
+    {
+        return self::errorResponse($e);
+    }
+
+    /**
+     * Map a request URI to a concrete PHP entry script under `$absPath`, or null
+     * when the request should run through the front controller.
+     *
+     * Pure and testable: takes the raw REQUEST_URI + the WordPress root and
+     * returns an absolute script path (guaranteed to live under `$absPath`) or
+     * null. Directory-traversal-safe via realpath containment.
+     *
+     * `/`, paths with no `.php` segment, and `/index.php` all return null (front
+     * controller). `/wp-login.php`, `/wp-admin/edit.php`, … return the file.
+     */
+    public static function routeScript(string $requestUri, string $absPath): ?string
+    {
+        $path = \parse_url($requestUri, \PHP_URL_PATH);
+        if (!\is_string($path) || $path === '' || $path === '/') {
+            return null;
         }
+
+        // Only .php targets route to a script; everything else is front-end.
+        $trimmed = \ltrim($path, '/');
+        if ($trimmed === 'index.php' || !\str_contains($trimmed, '.php')) {
+            return null;
+        }
+
+        // Keep only the part up to and including the first ".php" segment, so
+        // /wp-admin/edit.php/extra still resolves to wp-admin/edit.php.
+        $phpPos = \strpos($trimmed, '.php');
+        $scriptRel = \substr($trimmed, 0, $phpPos + 4);
+
+        $root = \rtrim($absPath, '/\\');
+        $candidate = $root . '/' . $scriptRel;
+
+        $real = \realpath($candidate);
+        if ($real === false || !\is_file($real)) {
+            return null;
+        }
+
+        // Containment: the resolved file MUST live under the WordPress root.
+        $realRoot = \realpath($root);
+        if ($realRoot === false || !\str_starts_with($real, $realRoot . \DIRECTORY_SEPARATOR)) {
+            return null;
+        }
+
+        return $real;
     }
 
     /**
      * Seed the PHP superglobals from the request Envelope.
      *
-     * The engine natively repopulates `$_SERVER` / `$_GET` / `$_COOKIE` when
-     * `worker_populate_superglobals = true`, but we defensively re-seed them all
-     * anyway (idempotent, and keeps the adapter correct even if that knob is off
-     * in a mis-configured deployment) and — critically — parse `$_POST` /
-     * `$_FILES` ourselves, since the native path never does.
+     * EMPIRICAL (see class docblock): the engine natively populates `$_GET` and
+     * `$_COOKIE` but leaves `$_SERVER` essentially empty. So this method:
+     *   - populates `$_SERVER` from the Envelope (WordPress needs REQUEST_URI /
+     *     HTTP_HOST / REQUEST_METHOD to route);
+     *   - does NOT reassign `$_GET` / `$_COOKIE` — replacing the engine-owned
+     *     superglobal zvals crashes the worker; the engine already set them;
+     *   - parses the raw body into `$_POST` / `$_FILES`, which the native path
+     *     never populates;
+     *   - rebuilds `$_REQUEST` from the (engine-owned) `$_GET` plus our `$_POST`.
      *
      * @param object $envelope an Ephpm\Worker\Envelope (or a compatible fake)
      */
@@ -204,41 +345,45 @@ final class Worker
     {
         /** @var array<string, mixed> $server */
         $server = $envelope->serverVars();
-        /** @var array<string, string> $cookies */
-        $cookies = $envelope->cookies();
-        /** @var array<string, mixed> $query */
-        $query = $envelope->query();
         $rawBody = (string) $envelope->rawBody();
 
-        $_SERVER = \array_merge($_SERVER, $server);
-        $_GET = $query;
-        $_COOKIE = $cookies;
+        // Populate $_SERVER from the Envelope (engine leaves it empty). Assigning
+        // individual keys (rather than replacing the whole array) avoids
+        // disturbing any engine-owned $_SERVER entries.
+        foreach ($server as $k => $v) {
+            $_SERVER[$k] = $v;
+        }
 
         $contentType = self::headerValue($server, 'CONTENT_TYPE');
-        $method = \strtoupper((string) ($server['REQUEST_METHOD'] ?? 'GET'));
+        $method = \strtoupper((string) ($server['REQUEST_METHOD'] ?? ($_SERVER['REQUEST_METHOD'] ?? 'GET')));
 
         [$post, $files] = self::parseBody($method, $contentType, $rawBody, $envelope);
 
+        // $_POST / $_FILES are ours to own (engine never populates them). These
+        // are plain PHP arrays, safe to (re)assign.
         $_POST = $post;
         $_FILES = $files;
 
-        // $_REQUEST is what a lot of WP/plugin code actually reads. Rebuild it
-        // GET + POST + COOKIE (PHP's default request_order is "GP", but WP code
-        // frequently assumes cookies too; GP is the safe subset — match PHP).
-        $_REQUEST = \array_merge($_GET, $_POST);
+        // $_REQUEST = engine-owned $_GET + our $_POST (PHP default request_order
+        // "GP"). Read $_GET, do not replace it.
+        $_REQUEST = \array_merge($_GET ?? [], $post);
 
-        // php://input parity: WordPress' REST API and many plugins read the raw
-        // body. The engine's Envelope::rawBody() is the source of truth; expose
-        // it via $GLOBALS for the shim used in the e2e image (see README).
+        // php://input parity: expose the raw body for REST/plugins that read it.
         $GLOBALS['EPHPM_WP_RAW_BODY'] = $rawBody;
     }
 
     /**
-     * Reset the request-scoped WordPress globals listed in {@see RESET_GLOBALS}.
+     * Reset request-scoped WordPress state before re-running the main query.
      *
-     * Unsetting is enough: WordPress lazily re-creates `$wp_query`, `$wp`, etc.
-     * during `wp()` / `WP::main()`. Booted-once state (`$wpdb`, `$wp_object_cache`,
-     * the hook arrays) is deliberately left untouched.
+     * Two-part reset:
+     *   1. Unset the transient loop/template globals in {@see RESET_GLOBALS} —
+     *      WordPress re-derives them during the template stack.
+     *   2. Re-instantiate the query objects (`$wp_query`, `$wp_the_query`) as
+     *      fresh `WP_Query` instances and reset the `$wp` router's per-request
+     *      fields IN PLACE (not unset — `wp()` calls `$wp->main()` on it).
+     *
+     * Booted-once state (`$wpdb`, `$wp_object_cache`, the `$wp_filter` hook
+     * arrays) is deliberately left untouched.
      */
     public function resetRequestGlobals(): void
     {
@@ -246,13 +391,31 @@ final class Worker
             unset($GLOBALS[$name]);
         }
 
-        // WordPress caches the "did we already send headers" flag; force a fresh
-        // main query each request.
-        if (\function_exists('wp_cache_flush')) {
-            // Only flush the *runtime* (non-persistent) cache. Persistent object
-            // caches (ephpm/cache-wordpress) manage their own per-request reset.
-            wp_cache_flush_runtime_if_available();
+        // Fresh query objects so the previous request's posts/flags never carry
+        // over. WP_Query only exists once WordPress is booted.
+        if (\class_exists('WP_Query', false)) {
+            $GLOBALS['wp_the_query'] = new \WP_Query();
+            $GLOBALS['wp_query'] = $GLOBALS['wp_the_query'];
         }
+
+        // Reset the resident WP router object in place. Its constructor-set
+        // fields are cleared so parse_request() starts clean; the object itself
+        // is preserved because wp() calls $wp->main() on this exact global.
+        if (isset($GLOBALS['wp']) && $GLOBALS['wp'] instanceof \WP) {
+            $wp = $GLOBALS['wp'];
+            $wp->query_vars = [];
+            $wp->query_string = '';
+            $wp->matched_rule = '';
+            $wp->matched_query = '';
+            $wp->did_permalink = false;
+            $wp->request = '';
+        } elseif (\class_exists('WP', false)) {
+            $GLOBALS['wp'] = new \WP();
+        }
+
+        // Flush only the runtime (non-persistent) object cache; a persistent
+        // backend (ephpm/cache-wordpress) manages its own per-request reset.
+        wp_cache_flush_runtime_if_available();
     }
 
     // ---------------------------------------------------------------------
@@ -578,6 +741,38 @@ final class Worker
             "<!DOCTYPE html>\n<html><head><title>Error</title></head>"
             . "<body><h1>Internal Server Error</h1></body></html>",
         ];
+    }
+}
+
+/**
+ * Thrown by the `wp_redirect` filter installed in {@see Worker::installHooks()}
+ * to unwind cleanly to the worker loop instead of letting WordPress `exit`
+ * mid-request (which crashes the worker). The loop catches it and emits a real
+ * 3xx via {@see Worker::redirectResponse()}.
+ */
+final class RedirectSignal extends \RuntimeException
+{
+    public function __construct(
+        public readonly string $location,
+        public readonly int $status = 302,
+    ) {
+        parent::__construct('wp_redirect intercepted: ' . $location);
+    }
+}
+
+/**
+ * Thrown by the `rest_pre_serve_request` filter in {@see Worker::installHooks()}
+ * to unwind cleanly with the serialised REST JSON instead of letting
+ * `WP_REST_Server::serve_request()` echo + `die()` (which crashes the worker).
+ * The loop catches it and emits the JSON via {@see Worker::restResponse()}.
+ */
+final class RestServed extends \RuntimeException
+{
+    public function __construct(
+        public readonly string $json,
+        public readonly int $status = 200,
+    ) {
+        parent::__construct('REST response served (' . $status . ')');
     }
 }
 

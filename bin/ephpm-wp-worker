@@ -18,81 +18,124 @@ declare(strict_types=1);
  * assumes real $_SERVER/$_GET/$_COOKIE superglobals. See the package README.
  */
 
+use Ephpm\WordPress\RedirectSignal;
+use Ephpm\WordPress\RestServed;
 use Ephpm\WordPress\Worker;
 use Ephpm\Worker\Runtime;
 
-(static function (array $argv): int {
-    // --- 1. Locate the Composer autoloader (search upward from CWD & script). -
-    $autoload = null;
-    $seeds = [getcwd() ?: __DIR__, __DIR__];
-    foreach ($seeds as $seed) {
-        $dir = $seed;
-        while (true) {
-            $candidate = $dir . DIRECTORY_SEPARATOR . 'vendor' . DIRECTORY_SEPARATOR . 'autoload.php';
-            if (is_file($candidate)) {
-                $autoload = $candidate;
-                break 2;
-            }
-            $parent = dirname($dir);
-            if ($parent === $dir) {
-                break; // reached filesystem root
-            }
-            $dir = $parent;
+// --- 1. Locate the Composer autoloader (search upward from CWD & script). -----
+$__ephpm_autoload = null;
+foreach ([getcwd() ?: __DIR__, __DIR__] as $__seed) {
+    $__dir = $__seed;
+    while (true) {
+        $__cand = $__dir . DIRECTORY_SEPARATOR . 'vendor' . DIRECTORY_SEPARATOR . 'autoload.php';
+        if (is_file($__cand)) {
+            $__ephpm_autoload = $__cand;
+            break 2;
         }
-    }
-
-    if ($autoload === null) {
-        fwrite(STDERR, "ephpm-wp-worker: could not locate vendor/autoload.php (run composer install).\n");
-
-        return 1;
-    }
-
-    require $autoload;
-
-    // --- 2. Fail fast if not under ePHPm worker mode. ------------------------
-    Runtime::assertAvailable();
-
-    // --- 3. Locate the WordPress root. ---------------------------------------
-    $absPath = $argv[1] ?? getenv('EPHPM_WP_PATH') ?: null;
-
-    if ($absPath === null && defined('ABSPATH')) {
-        $absPath = ABSPATH;
-    }
-
-    if ($absPath === null) {
-        // Walk upward from CWD looking for wp-load.php.
-        $dir = getcwd() ?: __DIR__;
-        while (true) {
-            if (is_file($dir . DIRECTORY_SEPARATOR . 'wp-load.php')) {
-                $absPath = $dir;
-                break;
-            }
-            $parent = dirname($dir);
-            if ($parent === $dir) {
-                break;
-            }
-            $dir = $parent;
+        $__parent = dirname($__dir);
+        if ($__parent === $__dir) {
+            break;
         }
+        $__dir = $__parent;
     }
+}
 
-    if ($absPath === null) {
-        fwrite(
-            STDERR,
-            "ephpm-wp-worker: could not locate WordPress.\n"
-            . "Set EPHPM_WP_PATH to the WordPress root, or pass it as the first argument.\n"
-        );
+if ($__ephpm_autoload === null) {
+    fwrite(STDERR, "ephpm-wp-worker: could not locate vendor/autoload.php (run composer install).\n");
+    exit(1);
+}
 
-        return 1;
+require $__ephpm_autoload;
+
+// --- 2. Fail fast if not under ePHPm worker mode. -----------------------------
+Runtime::assertAvailable();
+
+// --- 3. Locate the WordPress root. --------------------------------------------
+$__abs = $argv[1] ?? getenv('EPHPM_WP_PATH') ?: null;
+if ($__abs === null && defined('ABSPATH')) {
+    $__abs = ABSPATH;
+}
+if ($__abs === null) {
+    $__dir = getcwd() ?: __DIR__;
+    while (true) {
+        if (is_file($__dir . DIRECTORY_SEPARATOR . 'wp-load.php')) {
+            $__abs = $__dir;
+            break;
+        }
+        $__parent = dirname($__dir);
+        if ($__parent === $__dir) {
+            break;
+        }
+        $__dir = $__parent;
     }
+}
+if ($__abs === null) {
+    fwrite(
+        STDERR,
+        "ephpm-wp-worker: could not locate WordPress.\n"
+        . "Set EPHPM_WP_PATH to the WordPress root, or pass it as the first argument.\n"
+    );
+    exit(1);
+}
+$__abs = rtrim($__abs, "/\\") . '/';
+if (!is_file($__abs . 'wp-load.php')) {
+    fwrite(STDERR, "ephpm-wp-worker: no wp-load.php under {$__abs}\n");
+    exit(1);
+}
 
-    $absPath = rtrim($absPath, "/\\") . '/';
+// --- 4. Boot WordPress ONCE at GLOBAL scope. ----------------------------------
+// This MUST be a top-level require (not inside a function/method): wp-settings.php
+// creates $wpdb/$table_prefix/$wp_the_query/... without `global`, so a function
+// -scoped require would trap them in the call frame and destabilise WordPress
+// (the worker crashes during template rendering). See the Worker class docblock.
+Worker::defineBootConstants($__abs);
+require $__abs . 'wp-load.php';
 
-    if (!is_file($absPath . 'wp-load.php')) {
-        fwrite(STDERR, "ephpm-wp-worker: no wp-load.php under {$absPath}\n");
+// --- 5. Run the worker loop against the resident WordPress. -------------------
+// The loop lives HERE, at global scope, because wp() + the template loader + the
+// theme all assume global scope (running them inside a method traps their
+// top-level variables and crashes the worker). The Worker object only provides
+// the marshaling/reset/response helpers.
+// NB: not named $wp — that global is WordPress's own WP router object.
+$__ephpmWorker = new Worker($__abs);
+$__ephpmWorker->installHooks();
 
-        return 1;
+while (($__env = \Ephpm\Worker\take_request()) !== null) {
+    ob_start();
+    try {
+        $__target = $__ephpmWorker->beforeRequest($__env);
+        if ($__target !== null) {
+            // A concrete entry script (wp-login.php, wp-admin/*, ...). It re-uses
+            // the resident WordPress and typically exit()s at the end; this build
+            // delivers the captured output on exit.
+            require $__target;
+        } else {
+            // Front controller: routing + main query + template, at global scope.
+            wp();
+            require ABSPATH . WPINC . '/template-loader.php';
+        }
+        [$__st, $__hd, $__body] = Worker::finishResponse((string) ob_get_clean());
+        \Ephpm\Worker\send_response($__st, $__hd, $__body);
+    } catch (RedirectSignal $__r) {
+        while (ob_get_level() > 0) {
+            ob_end_clean();
+        }
+        [$__st, $__hd, $__body] = Worker::redirectResponse($__r);
+        \Ephpm\Worker\send_response($__st, $__hd, $__body);
+    } catch (RestServed $__rs) {
+        while (ob_get_level() > 0) {
+            ob_end_clean();
+        }
+        [$__st, $__hd, $__body] = Worker::restResponse($__rs);
+        \Ephpm\Worker\send_response($__st, $__hd, $__body);
+    } catch (\Throwable $__e) {
+        while (ob_get_level() > 0) {
+            ob_end_clean();
+        }
+        [$__st, $__hd, $__body] = Worker::errorResponseTriple($__e);
+        \Ephpm\Worker\send_response($__st, $__hd, $__body);
     }
+}
 
-    // --- 4. Boot WordPress once and run the worker loop. ---------------------
-    return (new Worker($absPath))->run();
-})($argv);
+exit(0);

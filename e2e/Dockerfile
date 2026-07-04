@@ -20,13 +20,16 @@ RUN apk add --no-cache curl tar bash
 
 ARG WP_VERSION=6.7.1
 
-# 1. WordPress core.
+# 1. WordPress core. NOTE: the composer:2 base image already ships an (empty)
+#    /var/www/html owned by www-data, so `mv wordpress html` would nest the tree
+#    under html/wordpress. Extract straight into /var/www/html instead.
 WORKDIR /var/www
 RUN curl -fsSL "https://wordpress.org/wordpress-${WP_VERSION}.tar.gz" -o wp.tgz \
-    && tar -xzf wp.tgz \
-    && mv wordpress html \
+    && mkdir -p /var/www/html /var/www/db \
+    && tar -xzf wp.tgz --strip-components=1 -C /var/www/html \
     && rm wp.tgz \
-    && mkdir -p /var/www/db /var/www/html/wp-content/mu-plugins
+    && mkdir -p /var/www/html/wp-content/mu-plugins \
+    && test -f /var/www/html/wp-load.php
 
 # 2. wp-sqlite-db SQLite drop-in (self-contained; no MySQL). Installed as
 #    wp-content/db.php so WordPress uses SQLite transparently.
@@ -54,7 +57,14 @@ RUN composer install --no-interaction --no-dev
 # 4. Config + entrypoints.
 COPY wp-config.php /var/www/html/wp-config.php
 COPY worker.php   /var/www/html/worker.php
-COPY muplugin/ephpm-e2e.php /var/www/html/wp-content/mu-plugins/ephpm-e2e.php
+COPY muplugin/ephpm-e2e.php      /var/www/html/wp-content/mu-plugins/ephpm-e2e.php
+COPY muplugin/empty-template.php /var/www/html/wp-content/mu-plugins/empty-template.php
+
+# A minimal CLASSIC theme. WP 6.7 ships only block themes, whose full block
+# rendering engine currently crashes the ePHPm worker (see README known
+# limitations / e2e findings). The classic theme exercises the normal template
+# hierarchy + WordPress loop, which is worker-safe.
+COPY classic-theme/ /var/www/html/wp-content/themes/ephpm-e2e-classic/
 
 # 5. Run the WordPress install headless so the site has an admin user + a post.
 #    We drive wp_install() directly with the embedded composer php (SQLite).

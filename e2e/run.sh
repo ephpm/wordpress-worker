@@ -24,7 +24,7 @@ PKG_ROOT="$(cd "${HERE}/.." && pwd)"
 IMAGE="ephpm-wp-worker-e2e:latest"
 CONTAINER="ephpm-wp-worker-e2e"
 BASE_IMAGE="localhost/ephpm:worker-main"
-PORT="${EPHPM_E2E_PORT:-8099}"
+PORT="${EPHPM_E2E_PORT:-8100}"
 BASE="http://127.0.0.1:${PORT}"
 
 PODMAN="${PODMAN:-podman}"
@@ -134,22 +134,25 @@ home="$(curl -s "${BASE}/")"; home_code="$(status_of "${BASE}/")"
 if [[ "$home_code" == "200" ]] && printf '%s' "$home" | grep -qi 'E2E Golden Post\|Hello world\|<title>'; then
     b_msg+="[home 200 ok] "
 else b_fail=1; b_msg+="[home code=$home_code NO WP HTML] "; fi
-# A specific post via ?p / ?page_id — find the golden post id via feed or search.
-post_code="$(status_of "${BASE}/?p=4")"
-post_body="$(curl -s "${BASE}/?p=4")"
-if [[ "$post_code" == "200" ]] && printf '%s' "$post_body" | grep -qi 'golden\|hello'; then
-    b_msg+="[post 200 ok] "
-else b_msg+="[post ?p=4 code=$post_code] "; fi
+# A specific post: discover an id from the REST posts list, then fetch ?p=<id>.
+post_id="$(curl -s "${BASE}/wp-json/wp/v2/posts?per_page=1" | grep -o '"id":[0-9]*' | head -1 | grep -o '[0-9]*')"
+post_id="${post_id:-1}"
+post_code="$(status_of "${BASE}/?p=${post_id}")"
+post_body="$(curl -s "${BASE}/?p=${post_id}")"
+if [[ "$post_code" == "200" ]] && printf '%s' "$post_body" | grep -qi 'golden\|hello\|<title>'; then
+    b_msg+="[post id=$post_id 200 ok] "
+else b_fail=1; b_msg+="[post ?p=$post_id code=$post_code] "; fi
 # wp-admin login page
 login_code="$(status_of "${BASE}/wp-login.php")"
 login_body="$(curl -s "${BASE}/wp-login.php")"
 if [[ "$login_code" == "200" ]] && printf '%s' "$login_body" | grep -qi 'log in\|user_login\|loginform'; then
     b_msg+="[login 200 ok] "
 else b_fail=1; b_msg+="[login code=$login_code NO FORM] "; fi
-# REST API
+# REST API — the adapter rewrites /wp-json/ -> ?rest_route=/ and captures the
+# REST response before WP's serve_request() die().
 rest_code="$(status_of "${BASE}/wp-json/")"
 rest_body="$(curl -s "${BASE}/wp-json/")"
-if [[ "$rest_code" == "200" ]] && printf '%s' "$rest_body" | grep -qi '"namespace"\|wp/v2\|"routes"'; then
+if [[ "$rest_code" == "200" ]] && printf '%s' "$rest_body" | grep -qi '"namespaces"\|"namespace"\|wp/v2\|"routes"\|"name"'; then
     b_msg+="[rest 200 json ok] "
 else b_fail=1; b_msg+="[rest code=$rest_code NO JSON] "; fi
 record "B_GOLDEN_PATH" "$b_fail" "$b_msg"

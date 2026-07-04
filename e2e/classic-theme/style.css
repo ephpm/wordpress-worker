@@ -1,0 +1,11 @@
+/*
+Theme Name: ePHPm E2E Classic
+Theme URI: https://github.com/ephpm/wordpress-worker
+Author: ePHPm
+Description: Minimal classic (non-block) theme for the worker e2e suite. Block
+ themes render through the full block engine which currently crashes the worker
+ (see package README known limitations); a classic theme exercises the normal
+ template hierarchy and the WordPress loop.
+Version: 1.0
+License: MIT
+*/

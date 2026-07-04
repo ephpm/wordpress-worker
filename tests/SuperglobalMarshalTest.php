@@ -20,43 +20,40 @@ final class SuperglobalMarshalTest extends TestCase
         $_SERVER = ['SCRIPT_NAME' => '/index.php'];
     }
 
-    public function testGetQueryAndCookiesAreSeeded(): void
+    public function testServerVarsAreSeededFromEnvelope(): void
     {
+        // The engine leaves $_SERVER empty in worker mode; marshal fills it from
+        // the Envelope. $_GET / $_COOKIE are engine-owned and NOT touched here.
         $worker = new Worker('/tmp/wp/');
         $worker->marshalSuperglobals(new FakeEnvelope(
-            server: ['REQUEST_METHOD' => 'GET', 'REQUEST_URI' => '/?p=42'],
-            cookies: ['wordpress_logged_in' => 'abc'],
+            server: ['REQUEST_METHOD' => 'GET', 'REQUEST_URI' => '/?p=42', 'HTTP_HOST' => 'x'],
+            cookies: ['ignored' => 'by-marshal'],
             query: ['p' => '42'],
         ));
 
-        self::assertSame(['p' => '42'], $_GET);
-        self::assertSame(['wordpress_logged_in' => 'abc'], $_COOKIE);
         self::assertSame('GET', $_SERVER['REQUEST_METHOD']);
-        // Pre-existing $_SERVER keys are preserved (merge, not replace).
+        self::assertSame('/?p=42', $_SERVER['REQUEST_URI']);
+        self::assertSame('x', $_SERVER['HTTP_HOST']);
+        // Pre-existing $_SERVER keys are preserved (per-key assign, not replace).
         self::assertSame('/index.php', $_SERVER['SCRIPT_NAME']);
+        // marshal must NOT overwrite the engine-owned $_GET / $_COOKIE.
+        self::assertSame([], $_COOKIE, 'marshal must not touch engine-owned $_COOKIE');
     }
 
-    public function testNoBleedBetweenRequests(): void
+    public function testServerVarsDoNotBleedRequestToRequest(): void
     {
         $worker = new Worker('/tmp/wp/');
 
         $worker->marshalSuperglobals(new FakeEnvelope(
-            server: ['REQUEST_METHOD' => 'GET'],
-            cookies: ['sid' => 'first'],
-            query: ['q' => 'one'],
+            server: ['REQUEST_METHOD' => 'GET', 'REQUEST_URI' => '/one'],
         ));
-        self::assertSame(['q' => 'one'], $_GET);
-        self::assertSame(['sid' => 'first'], $_COOKIE);
+        self::assertSame('/one', $_SERVER['REQUEST_URI']);
 
-        // Second request with entirely different values must fully replace.
         $worker->marshalSuperglobals(new FakeEnvelope(
-            server: ['REQUEST_METHOD' => 'GET'],
-            cookies: [],
-            query: ['page_id' => '7'],
+            server: ['REQUEST_METHOD' => 'POST', 'REQUEST_URI' => '/two'],
         ));
-        self::assertSame(['page_id' => '7'], $_GET);
-        self::assertSame([], $_COOKIE);
-        self::assertArrayNotHasKey('q', $_GET);
+        self::assertSame('/two', $_SERVER['REQUEST_URI']);
+        self::assertSame('POST', $_SERVER['REQUEST_METHOD']);
     }
 
     public function testUrlencodedPostIsParsedIntoPost(): void

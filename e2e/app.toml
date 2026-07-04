@@ -1,11 +1,14 @@
 # ephpm config for the WordPress worker-mode e2e image.
 [server]
 listen = "0.0.0.0:8080"
+document_root = "/var/www/html"        # the WordPress root (ABSPATH)
 
 [php]
 mode = "worker"
 worker_script = "worker.php"
 worker_populate_superglobals = true   # REQUIRED for WordPress
-document_root = "/var/www/html"
-worker_count = 2                       # small pool; recycling tested separately
-worker_max_requests = 500
+worker_count = 3                       # a few workers so exit-based routes
+                                       # (wp-login/REST end in exit -> recycle)
+                                       # don't starve the pool
+worker_max_requests = 2000
+worker_boot_timeout = 120              # generous boot window for WordPress

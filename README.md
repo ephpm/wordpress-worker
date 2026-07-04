@@ -34,16 +34,16 @@ in memory, servicing requests in a loop instead of paying the full
 ## Required `ephpm.toml`
 
 ```toml
+[server]
+listen = "0.0.0.0:8080"
+document_root = "/var/www/html"         # the WordPress root (ABSPATH)
+
 [php]
 mode = "worker"
 worker_script = "worker.php"            # your loop; see below
 worker_populate_superglobals = true     # REQUIRED for WordPress
-document_root = "/var/www/html"         # the WordPress root (ABSPATH)
 worker_count = 4                         # WordPress ~40 MB/worker — size accordingly
 worker_max_requests = 500                # recycle to reclaim slow memory growth
-
-[server]
-listen = "0.0.0.0:8080"
 ```
 
 Set `EPHPM_WP_PATH` to the WordPress root (defaults to `document_root` via the
@@ -73,31 +73,55 @@ requests and leaves the persistent object cache to manage its own lifecycle.
 
 ## Known limitations
 
-These are **real** and you should understand them before shipping:
+These are **real**, validated by the e2e suite, and you should understand them
+before shipping:
 
-- **Procedural reset is best-effort.** Only the globals in
-  `Worker::RESET_GLOBALS` are reset. A plugin that stashes per-request state in
-  a static property, a global not on that list, or a singleton **will** leak
-  across requests within a worker. Recycling (`worker_max_requests`) bounds the
-  blast radius but does not eliminate it. Test your plugin stack with the e2e
-  harness.
+- **Block rendering crashes the worker.** WordPress' block engine
+  (`do_blocks()`, block themes) crashes the ePHPm worker mid-render. Use a
+  **classic theme** and **non-block (plain/classic) post content**. This is the
+  single biggest limitation today and is an engine-level issue, not something
+  this adapter can work around. (The e2e site uses a bundled classic theme and
+  plain-content fixtures for exactly this reason.)
+- **The request loop must run at global scope.** WordPress' request cycle
+  (`wp()`, the template loader, the theme) assumes global scope. Running it
+  inside a class method traps WordPress' top-level variables and crashes the
+  worker, so the loop lives in the entry script (`bin/ephpm-wp-worker`); this
+  class only provides the marshaling/response helpers. Boot `wp-load.php` at
+  global scope too.
+- **`exit`/`die` deep inside `wp()` crashes the worker.** An `exit` from a
+  top-level required entry script (`wp-login.php`) is fine, but an `exit`/`die`
+  that unwinds *through the resident `wp()` call* (canonical redirects, the REST
+  server's `serve_request()` die) crashes the worker. This adapter intercepts
+  `wp_redirect` and `rest_pre_serve_request` and unwinds cleanly instead — so
+  redirects and the REST API work — but any *other* plugin/core path that
+  `exit`s from within `wp()` will still take the worker down (it recycles and
+  serves the next request cleanly, at the cost of one boot).
+- **REST needs the adapter's rewrite.** With plain permalinks the adapter
+  rewrites `/wp-json/…` → `?rest_route=…` and captures the REST JSON before the
+  `die()`. Pretty-permalink REST rewrites are not required.
+- **Procedural reset is best-effort.** The transient loop globals in
+  `Worker::RESET_GLOBALS` are unset and the query objects re-instantiated each
+  request, but a plugin that stashes per-request state in a static property, a
+  global not on the list, or a **dynamically-registered hook** will leak across
+  requests within a worker. (The bundled mu-plugin demonstrates the hook-leak
+  trap and how to avoid it — register filters once, self-gate per request.)
+  Recycling (`worker_max_requests`) bounds the blast radius.
+- **`$_SERVER` is populated by this adapter.** The engine populates `$_GET` /
+  `$_COOKIE` natively but leaves `$_SERVER` empty in worker mode, so the adapter
+  fills `$_SERVER` (REQUEST_URI/HTTP_HOST/…) from the Envelope. It deliberately
+  does **not** reassign `$_GET`/`$_COOKIE` — replacing those engine-owned
+  superglobals crashes the worker.
 - **`$_POST` / `$_FILES` are parsed by this adapter, not the engine.** The
-  native worker path does not parse form or multipart bodies (`Envelope::parsedBody()`
-  returns `null`), so this package parses the raw body itself. The multipart
+  native worker path never populates them (`Envelope::parsedBody()` returns
+  `null`), so this package parses the raw body for
+  `application/x-www-form-urlencoded` and `multipart/form-data`. The multipart
   parser is pragmatic, not a byte-for-byte clone of PHP's C rfc1867 parser.
-  Large uploads and exotic multipart shapes should be validated for your
-  workload.
 - **No true streaming (Phase 1).** The request body is buffered and the response
-  body is fully materialised before `send_response()`. Large downloads/uploads
-  hold memory.
-- **Fatals recycle the worker.** An uncatchable engine-level fatal in a hook
-  takes down the worker; ePHPm respawns it and serves the next request from a
-  clean boot. A single request's fatal never serves stale state, but it does
-  cost one worker boot.
-- **Not all of WordPress is re-entrant.** Anything that assumes a fresh process
-  per request (e.g. code relying on `register_shutdown_function` firing at
-  process exit, or one-time `define()`s guarded only by `defined()`) may behave
-  differently under a long-lived worker.
+  body is fully materialised before `send_response()`.
+- **Fatals recycle the worker.** An uncatchable fatal in a hook takes down the
+  worker; ePHPm respawns it and serves the next request from a clean boot. A
+  single request's fatal never serves stale state, but costs one worker boot.
+  Run enough workers (`worker_count`) that recycling doesn't starve the pool.
 
 ## Testing
 

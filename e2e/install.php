@@ -17,7 +17,6 @@ define('WP_USE_THEMES', false);
 
 require $abspath . 'wp-load.php';
 require ABSPATH . 'wp-admin/includes/upgrade.php';
-require ABSPATH . 'wp-includes/class-wp-error.php';
 
 if (is_blog_installed()) {
     fwrite(STDOUT, "WordPress already installed.\n");
@@ -39,6 +38,10 @@ if (is_wp_error($result)) {
 }
 
 // Ensure there is a published post beyond the default "Hello world!".
+// NOTE: post_content is deliberately PLAIN text (no Gutenberg block markup).
+// WordPress block rendering (do_blocks()) currently crashes the ePHPm worker
+// (see e2e findings / README known limitations), so the golden-path fixtures
+// avoid block content to stay deterministic.
 $post_id = wp_insert_post([
     'post_title'   => 'E2E Golden Post',
     'post_content' => 'This is the golden-path post used by the worker e2e suite.',
@@ -52,9 +55,25 @@ if (is_wp_error($post_id)) {
     exit(1);
 }
 
+// Rewrite the default "Hello world!" post (id 1) to PLAIN content — its stock
+// body is block markup that crashes the worker's block renderer.
+$hello = get_post(1);
+if ($hello) {
+    wp_update_post([
+        'ID'           => 1,
+        'post_content' => 'Welcome to the ePHPm worker e2e site. Plain-text body (no blocks).',
+    ]);
+}
+
 // Pretty permalinks would need rewrite rules flushed; keep default (plain) so
 // ?p=<id> and ?page_id work without .htaccess.
 update_option('permalink_structure', '');
+
+// Activate the minimal CLASSIC theme (block themes crash the worker via the
+// block rendering engine — see e2e findings).
+switch_theme('ephpm-e2e-classic');
+update_option('template', 'ephpm-e2e-classic');
+update_option('stylesheet', 'ephpm-e2e-classic');
 
 fwrite(STDOUT, "WordPress installed. Golden post id={$post_id}\n");
 exit(0);

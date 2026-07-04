@@ -3,3 +3,5 @@ composer.lock
 .phpunit.result.cache
 .phpunit.cache/
 /e2e/.build/
+# run.sh regenerates this from the package source at build time.
+/e2e/pkgsrc/

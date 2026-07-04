@@ -1,0 +1,4 @@
+<?php
+// Minimal classic theme support.
+add_theme_support('title-tag');
+add_theme_support('automatic-feed-links');
