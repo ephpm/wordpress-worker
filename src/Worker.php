@@ -40,10 +40,12 @@ use Throwable;
  *     `$_COOKIE` — replacing the engine-owned superglobal zvals crashes the
  *     worker. `$_POST`/`$_FILES` are also never populated natively, so the
  *     adapter parses the raw body for those.
- *   - `wp_redirect()` ends in `exit`; letting WordPress `exit` mid-request from
- *     `redirect_canonical` (e.g. on a WP_HOME host/port mismatch) crashes the
- *     worker. {@see installHooks()} intercepts `wp_redirect` and unwinds
- *     cleanly via {@see RedirectSignal} so the loop emits a real 3xx instead.
+ *   - `wp_redirect()` ends in `exit`. The engine now survives a mid-request
+ *     `exit` (it synthesizes the response from the SAPI headers + captured
+ *     output and recycles the worker), but a recycle means a full WordPress
+ *     re-boot per redirect — so {@see installHooks()} still intercepts
+ *     `wp_redirect` and unwinds cleanly via {@see RedirectSignal}, keeping the
+ *     worker resident while the loop emits a real 3xx.
  *   - `send_response()` concatenates captured `echo` output with the explicit
  *     `$body`, so the adapter `ob_start()`s and passes the captured buffer as
  *     `$body` (native output stays at zero).
@@ -129,15 +131,18 @@ final class Worker
      * Install the per-worker WordPress hooks. Call ONCE after boot (from the
      * entry script's global scope, before the request loop).
      *
-     * Two interceptions, both to avoid a mid-`wp()` `exit`/`die` (which crashes
-     * the resident worker, unlike an exit from a top-level required script):
+     * Two interceptions, both to avoid a mid-`wp()` `exit`/`die`. The engine
+     * handles a mid-request exit gracefully (it synthesizes the response from
+     * the SAPI headers + captured output and recycles the worker), but the
+     * recycle costs a full WordPress re-boot — so unwinding via an exception
+     * keeps the worker resident:
      *
      *   - `wp_redirect`: WordPress redirects with `wp_redirect($loc); exit;`.
      *     The filter throws a {@see RedirectSignal} the loop turns into a 3xx.
      *   - `rest_pre_serve_request`: the REST server ends `serve_request()` with
      *     `die()`. The filter serialises the response itself, then throws a
      *     {@see RestServed} signal the loop turns into the JSON response — so the
-     *     REST API works without the crashing die().
+     *     REST API works without recycling the worker on every call.
      */
     public function installHooks(): void
     {
@@ -235,7 +240,7 @@ final class Worker
      * Build the `[status, headers, body]` triple for `send_response()` from a
      * captured output-buffer body plus WordPress' emitted status/headers.
      *
-     * @return array{0: int, 1: array<string, string>, 2: string}
+     * @return array{0: int, 1: array<string, string|list<string>>, 2: string}
      */
     public static function finishResponse(string $body): array
     {
@@ -245,29 +250,68 @@ final class Worker
     /**
      * Build a 3xx redirect response triple from a captured {@see RedirectSignal}.
      *
-     * @return array{0: int, 1: array<string, string>, 2: string}
+     * Starts from the FULL set of headers WordPress already emitted via
+     * `header()`/`setcookie()` (auth cookies set before `wp_redirect()` — e.g.
+     * by a login POST — must survive into the redirect), then overrides
+     * Location. Building the header map from scratch here would lose the
+     * session cookies and break login.
+     *
+     * @return array{0: int, 1: array<string, string|list<string>>, 2: string}
      */
     public static function redirectResponse(RedirectSignal $r): array
     {
-        return [
-            $r->status,
-            ['Location' => $r->location, 'Content-Type' => 'text/html; charset=UTF-8'],
-            '',
-        ];
+        return self::redirectResponseFromLines($r, \headers_list());
+    }
+
+    /**
+     * Pure variant of {@see redirectResponse()} taking `headers_list()`-shaped
+     * lines, so the header-preservation logic is testable without a live SAPI.
+     *
+     * @param list<string> $lines
+     *
+     * @return array{0: int, 1: array<string, string|list<string>>, 2: string}
+     */
+    public static function redirectResponseFromLines(RedirectSignal $r, array $lines): array
+    {
+        $headers = self::flattenHeaderLines($lines);
+        $headers = self::setHeader($headers, 'Location', $r->location);
+        if (!self::hasHeader($headers, 'Content-Type')) {
+            $headers['Content-Type'] = 'text/html; charset=UTF-8';
+        }
+
+        return [$r->status, $headers, ''];
     }
 
     /**
      * Build a JSON REST response triple from a captured {@see RestServed}.
      *
-     * @return array{0: int, 1: array<string, string>, 2: string}
+     * Starts from the FULL set of headers WordPress already emitted —
+     * `WP_REST_Server::serve_request()` sends `X-WP-Total`, `X-WP-TotalPages`,
+     * `Link`, `Allow`, nonce headers, … via `header()` BEFORE the
+     * `rest_pre_serve_request` filter fires, so they must be preserved.
+     * Content-Type is overridden to JSON (we serialise the payload ourselves).
+     *
+     * @return array{0: int, 1: array<string, string|list<string>>, 2: string}
      */
     public static function restResponse(RestServed $r): array
     {
-        return [
-            $r->status,
-            ['Content-Type' => 'application/json; charset=UTF-8'],
-            $r->json,
-        ];
+        return self::restResponseFromLines($r, \headers_list());
+    }
+
+    /**
+     * Pure variant of {@see restResponse()} taking `headers_list()`-shaped
+     * lines, so the header-preservation logic is testable without a live SAPI.
+     *
+     * @param list<string> $lines
+     *
+     * @return array{0: int, 1: array<string, string|list<string>>, 2: string}
+     */
+    public static function restResponseFromLines(RestServed $r, array $lines): array
+    {
+        $headers = self::flattenHeaderLines($lines);
+        $headers = self::setHeader($headers, 'Content-Type', 'application/json; charset=UTF-8');
+
+        return [$r->status, $headers, $r->json];
     }
 
     /**
@@ -619,6 +663,33 @@ final class Worker
     }
 
     /**
+     * Temp files spooled for the current request's uploads. A persistent worker
+     * would otherwise accumulate them forever (nothing else unlinks them —
+     * there is no per-request SAPI teardown in worker mode). The entry script
+     * calls {@see cleanupSpooledFiles()} in a `finally` after each response is
+     * sent.
+     *
+     * @var list<string>
+     */
+    private static array $spooledFiles = [];
+
+    /**
+     * Unlink the upload temp files spooled by {@see parseMultipart()} for the
+     * current request. Call AFTER the response has been sent (a `finally`
+     * around the request handling in the worker loop) — WordPress may still be
+     * reading/moving the files while the request is being handled.
+     */
+    public static function cleanupSpooledFiles(): void
+    {
+        foreach (self::$spooledFiles as $path) {
+            if (\is_file($path)) {
+                @\unlink($path);
+            }
+        }
+        self::$spooledFiles = [];
+    }
+
+    /**
      * Spool one uploaded file to a temp path and register it in `$files`
      * in `$_FILES` shape.
      *
@@ -636,8 +707,13 @@ final class Worker
         if ($tmp === false) {
             $tmp = '';
             $error = \UPLOAD_ERR_CANT_WRITE;
-        } elseif (\file_put_contents($tmp, $content) === false) {
-            $error = \UPLOAD_ERR_CANT_WRITE;
+        } else {
+            // Track for post-response cleanup even if the write below fails —
+            // tempnam() already created the file on disk.
+            self::$spooledFiles[] = $tmp;
+            if (\file_put_contents($tmp, $content) === false) {
+                $error = \UPLOAD_ERR_CANT_WRITE;
+            }
         }
 
         $files[$name] = [
@@ -664,13 +740,15 @@ final class Worker
 
     /**
      * Collect the response headers WordPress emitted via `header()` and flatten
-     * `headers_list()` (`['Name: value', ...]`) into the `['Name' => 'value']`
-     * map that `send_response()` expects.
+     * `headers_list()` (`['Name: value', ...]`) into the map that
+     * `send_response()` expects.
      *
-     * Multiple values for the same header (e.g. several `Set-Cookie`s) are
-     * joined with a comma to preserve them in the single-string-per-name shape.
+     * `Set-Cookie` values are collected into a LIST array (the engine emits one
+     * wire header per element) — they must NEVER be comma-joined, because
+     * cookie `expires=` dates contain commas. Other repeated headers are
+     * comma-joined per RFC 9110.
      *
-     * @return array<string, string>
+     * @return array<string, string|list<string>>
      */
     public static function collectHeaders(): array
     {
@@ -681,13 +759,18 @@ final class Worker
      * Pure flattener for a `headers_list()`-shaped array. Split from
      * {@see collectHeaders()} so it is testable without a live SAPI.
      *
+     * `Set-Cookie` (any casing) always maps to a list-array value; other
+     * repeated names are comma-joined per RFC 9110.
+     *
      * @param list<string> $lines
      *
-     * @return array<string, string>
+     * @return array<string, string|list<string>>
      */
     public static function flattenHeaderLines(array $lines): array
     {
         $flat = [];
+        /** @var array<string, string> $seen lowercase name => first-seen casing */
+        $seen = [];
         foreach ($lines as $line) {
             $pos = \strpos($line, ':');
             if ($pos === false) {
@@ -699,12 +782,59 @@ final class Worker
                 continue;
             }
 
-            $flat[$name] = isset($flat[$name])
-                ? $flat[$name] . ', ' . $value
+            $lower = \strtolower($name);
+            $key = $seen[$lower] ??= $name;
+
+            if ($lower === 'set-cookie') {
+                // List array: one wire header per cookie; NEVER comma-join
+                // (cookie expires= dates contain commas).
+                $flat[$key][] = $value;
+
+                continue;
+            }
+
+            $flat[$key] = isset($flat[$key])
+                ? $flat[$key] . ', ' . $value
                 : $value;
         }
 
         return $flat;
+    }
+
+    /**
+     * Set `$name` to `$value` in a flattened header map, replacing any existing
+     * entry with the same name regardless of casing.
+     *
+     * @param array<string, string|list<string>> $headers
+     *
+     * @return array<string, string|list<string>>
+     */
+    private static function setHeader(array $headers, string $name, string $value): array
+    {
+        foreach (\array_keys($headers) as $existing) {
+            if (\strcasecmp($existing, $name) === 0) {
+                unset($headers[$existing]);
+            }
+        }
+        $headers[$name] = $value;
+
+        return $headers;
+    }
+
+    /**
+     * Whether a flattened header map contains `$name` (case-insensitive).
+     *
+     * @param array<string, string|list<string>> $headers
+     */
+    private static function hasHeader(array $headers, string $name): bool
+    {
+        foreach (\array_keys($headers) as $existing) {
+            if (\strcasecmp($existing, $name) === 0) {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     /**
@@ -747,8 +877,9 @@ final class Worker
 /**
  * Thrown by the `wp_redirect` filter installed in {@see Worker::installHooks()}
  * to unwind cleanly to the worker loop instead of letting WordPress `exit`
- * mid-request (which crashes the worker). The loop catches it and emits a real
- * 3xx via {@see Worker::redirectResponse()}.
+ * mid-request (the engine would synthesize the response but recycle the
+ * worker — a full re-boot). The loop catches it and emits a real 3xx via
+ * {@see Worker::redirectResponse()}.
  */
 final class RedirectSignal extends \RuntimeException
 {
@@ -763,8 +894,9 @@ final class RedirectSignal extends \RuntimeException
 /**
  * Thrown by the `rest_pre_serve_request` filter in {@see Worker::installHooks()}
  * to unwind cleanly with the serialised REST JSON instead of letting
- * `WP_REST_Server::serve_request()` echo + `die()` (which crashes the worker).
- * The loop catches it and emits the JSON via {@see Worker::restResponse()}.
+ * `WP_REST_Server::serve_request()` echo + `die()` (the engine would synthesize
+ * the response but recycle the worker — a full re-boot per REST call). The
+ * loop catches it and emits the JSON via {@see Worker::restResponse()}.
  */
 final class RestServed extends \RuntimeException
 {
