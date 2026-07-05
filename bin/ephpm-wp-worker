@@ -107,8 +107,10 @@ while (($__env = \Ephpm\Worker\take_request()) !== null) {
         $__target = $__ephpmWorker->beforeRequest($__env);
         if ($__target !== null) {
             // A concrete entry script (wp-login.php, wp-admin/*, ...). It re-uses
-            // the resident WordPress and typically exit()s at the end; this build
-            // delivers the captured output on exit.
+            // the resident WordPress and typically exit()s at the end; the engine
+            // synthesizes the response from the SAPI headers + captured output
+            // when the script exits mid-request, and recycles the worker (fresh
+            // boot) afterward.
             require $__target;
         } else {
             // Front controller: routing + main query + template, at global scope.
@@ -135,6 +137,10 @@ while (($__env = \Ephpm\Worker\take_request()) !== null) {
         }
         [$__st, $__hd, $__body] = Worker::errorResponseTriple($__e);
         \Ephpm\Worker\send_response($__st, $__hd, $__body);
+    } finally {
+        // Unlink the upload temp files spooled for this request AFTER the
+        // response was sent — a persistent worker would accumulate them forever.
+        Worker::cleanupSpooledFiles();
     }
 }
 

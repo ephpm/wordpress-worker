@@ -67,6 +67,10 @@ while (($env = \Ephpm\Worker\take_request()) !== null) {
         }
         [$st, $hd, $body] = Worker::errorResponseTriple($e);
         \Ephpm\Worker\send_response($st, $hd, $body);
+    } finally {
+        // Unlink the upload temp files spooled for this request AFTER the
+        // response was sent — a persistent worker would accumulate them forever.
+        Worker::cleanupSpooledFiles();
     }
 }
 

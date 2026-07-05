@@ -116,6 +116,49 @@ final class BodyParseTest extends TestCase
         @\unlink($files['upload']['tmp_name']);
     }
 
+    public function testSpooledUploadTempFilesAreUnlinkedByCleanup(): void
+    {
+        // A persistent worker must not accumulate upload temp files: everything
+        // parseMultipart() spools is unlinked by cleanupSpooledFiles(), which
+        // the worker loop calls in a finally after each response is sent.
+        $boundary = '----ephpmCleanup';
+        $body = self::multipart($boundary, [
+            [
+                'name' => 'one',
+                'filename' => 'one.txt',
+                'ctype' => 'text/plain',
+                'value' => 'first',
+            ],
+            [
+                'name' => 'two',
+                'filename' => 'two.txt',
+                'ctype' => 'text/plain',
+                'value' => 'second',
+            ],
+        ]);
+
+        [, $files] = Worker::parseBody(
+            'POST',
+            "multipart/form-data; boundary={$boundary}",
+            $body,
+            self::env(),
+        );
+
+        $paths = [$files['one']['tmp_name'], $files['two']['tmp_name']];
+        foreach ($paths as $path) {
+            self::assertFileExists($path);
+        }
+
+        Worker::cleanupSpooledFiles();
+
+        foreach ($paths as $path) {
+            self::assertFileDoesNotExist($path);
+        }
+
+        // Idempotent: a second cleanup (next request with no uploads) is a no-op.
+        Worker::cleanupSpooledFiles();
+    }
+
     public function testMultipartArrayField(): void
     {
         $boundary = 'B';
