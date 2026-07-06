@@ -31,6 +31,35 @@ in memory, servicing requests in a loop instead of paying the full
   `$_SERVER/$_GET/$_COOKIE` superglobals. This is **not** the default; you must
   turn it on. Without it, WordPress routing and `$wpdb`-driven queries misbehave.
 
+## Install
+
+ePHPm packages are distributed via their GitHub repositories (not Packagist).
+Add every ePHPm repo in the dependency tree as a Composer `vcs` repository, then
+require the adapter. This package pulls in `ephpm/worker`, so **both** repos are
+listed — Composer does **not** resolve a VCS dependency's own VCS repositories
+transitively, so each ePHPm package in the tree needs its own `repositories`
+entry in your app's `composer.json`.
+
+```json
+{
+  "repositories": [
+    { "type": "vcs", "url": "https://github.com/ephpm/wordpress-worker" },
+    { "type": "vcs", "url": "https://github.com/ephpm/php-worker" }
+  ],
+  "require": {
+    "ephpm/wordpress-worker": "^0.1"
+  }
+}
+```
+
+Both `ephpm/wordpress-worker` and its `ephpm/worker` dependency are tagged
+`v0.1.0`, so `^0.1` resolves for each; each still needs its own `repositories`
+entry because Composer does not resolve VCS repos transitively. Then:
+
+```bash
+composer update
+```
+
 ## Required `ephpm.toml`
 
 ```toml
