@@ -18,11 +18,95 @@ in memory, servicing requests in a loop instead of paying the full
 2. **Per-request reset** — before re-running the main query the adapter unsets
    the request-scoped globals (`$wp_query`, `$wp_the_query`, `$wp`, `$post`,
    `$authordata`, `$pages`, `$wp_did_header`, request caches, …), re-seeds
-   `$_GET/$_POST/$_SERVER/$_COOKIE/$_FILES` from the request `Envelope`, and
+   `$_GET/$_POST/$_SERVER/$_COOKIE/$_FILES` from the request `Envelope`,
+   **re-fires the per-request action lifecycle (`init`, `wp_loaded`)** so plugin
+   handlers registered on those actions see this request's superglobals, and
    re-runs `wp()` + the template loader.
 3. **Response** — the request's output is captured with `ob_start()` and handed
    to `send_response()` as the body, with the status pulled from
    `http_response_code()` and headers from `headers_list()`.
+
+## Lifecycle contract
+
+WordPress under classic FPM re-runs the entire bootstrap — including every
+`wp-settings.php` `do_action()` — on every request. WordPress plugins are
+written against that contract: a handler registered on `init` or `wp_loaded`
+expects to fire per request, against the current request's superglobals.
+
+A resident worker cannot re-run file inclusion (`require wp-load.php`) per
+request — that would re-declare classes and functions and undo the whole point
+of worker mode. So this adapter splits WordPress' bootstrap into **boot-once**
+and **per-request** phases:
+
+| Runs ONCE per worker boot                    | Runs PER request (in order)             |
+| -------------------------------------------- | --------------------------------------- |
+| `require wp-load.php` (file inclusion)       | Superglobal marshaling from Envelope    |
+| `muplugins_loaded`                           | Reset of transient globals + query objs |
+| `plugins_loaded`                             | `do_action('init')`                     |
+| `sanitize_comment_cookies`                   | `do_action('wp_loaded')`                |
+| `setup_theme` / `after_setup_theme`          | `wp()` (routing + main query)           |
+| `set_current_user`                           | Template loader / active theme render   |
+| First fire of `init` (with empty $_GET)      | (response sent to client)               |
+| First fire of `wp_loaded` (with empty $_GET) | `do_action('shutdown')`                 |
+
+**Why re-fire `init` and `wp_loaded`?** Plugins hook these expecting per-request
+semantics: WooCommerce's `WC_Form_Handler::add_to_cart_action()` is registered on
+`wp_loaded` and reads `$_GET['add-to-cart']` per request. Without re-firing,
+`GET /?add-to-cart=<id>` renders a normal 200 page but the cart is empty and no
+`wp_woocommerce_session_*` cookie is set — a silent no-op.
+
+**Why not re-fire `plugins_loaded` / `after_setup_theme` / `set_current_user`?**
+Their names and contracts are one-shot per process: plugin/theme file
+inclusion, not request handling. Handlers on them typically do class wiring,
+translation loading, or user-derivation — safe to run once. Re-firing would
+double-fire class-wiring code with no request-scoped upside.
+
+**Why fire `shutdown` per iteration?** In classic FPM, `shutdown` fires when
+PHP tears the script down at request end (via
+`register_shutdown_function` → WordPress' `shutdown_action_hook()`). In
+worker mode the script never ends, so `shutdown` never fires — but hooks
+registered on it accumulate work that never runs. Most visibly,
+`WC_Session_Handler::save_data()` is hooked on `shutdown`: without firing it
+per iteration, guest cart state never lands in `wp_woocommerce_sessions`,
+and `GET /wp-json/wc/store/v1/cart` keeps returning an empty guest cart
+even after `/?add-to-cart=<id>` successfully set the session cookie. The
+adapter fires `shutdown` in the request-loop `finally` block, so the
+response has already been sent to the client and shutdown-hook errors don't
+affect the response body. Hook exceptions are logged and swallowed — one
+broken plugin should not take down the worker pool.
+
+### Observable differences from FPM
+
+- **`did_action('init')` / `did_action('wp_loaded')`**. The adapter zeros these
+  counters after boot (`Worker::resetBootActionCounters()`), so the first
+  request sees `did_action('init') === 1` — same as FPM. However, over the
+  worker's lifetime the counter climbs monotonically instead of resetting to
+  `0` per request. Well-behaved code that treats these as `>0` booleans works
+  unchanged; code that expects `=== 1` per request will see higher numbers.
+- **`did_action('plugins_loaded')` etc.** stay at `1` and never increment
+  (deliberate — see above), so this is FPM-like from any single request's
+  point of view.
+- **Handlers that mutate global registrations from within `init` /
+  `wp_loaded`.** A handler that calls `add_action(…)` / `add_filter(…)` /
+  `register_post_type(…)` inside its own `init` body will register a fresh
+  callback / a fresh post-type on every request, growing `$wp_filter` /
+  `$wp_post_types` unboundedly. Well-behaved plugins register hooks at
+  plugin-load time (or self-gate with a static flag); the `worker_max_requests`
+  ceiling bounds the blast radius for the ones that don't.
+- **Handlers on `shutdown` that call `exit`.** Under FPM, `shutdown` fires
+  from PHP's tear-down and any `exit`/`die` inside a handler is harmless
+  (the script was ending anyway). Under the worker, an `exit` inside a
+  shutdown hook would terminate the worker mid-loop. The adapter catches
+  `Throwable`s inside the shutdown re-fire and logs them but does NOT catch
+  `exit()` calls (they can't be caught in PHP). Handlers that `exit` inside
+  `shutdown` will therefore recycle the worker — noisy but safe (the
+  response was already sent).
+- **Per-request cost.** Re-firing `init` + `wp_loaded` + `shutdown` on a
+  fresh WP 6.7 + WooCommerce install measures **on the order of a few ms
+  per request** on a laptop (see the PR that added this contract; the
+  regression harness reports a probe wall-clock median). This is the price
+  of FPM parity for the plugin ecosystem; there is no path to a
+  fully-correct worker mode that avoids it.
 
 ## Requirements
 
@@ -91,6 +175,28 @@ exit((new Ephpm\WordPress\Worker(getenv('EPHPM_WP_PATH') . '/'))->run());
 ```
 
 or just use the bundled `bin/ephpm-wp-worker` as your `worker_script`.
+
+## Running WooCommerce
+
+WooCommerce runs under this adapter, but its guest-session handler is a
+boot-once singleton (`WC()->session` is set once per worker via
+`WC::initialize_session()`). Under a persistent worker that means every
+request re-uses the worker's boot-time session ID and never re-reads the
+client's `wp_woocommerce_session_*` cookie — so guest cart data doesn't
+follow the client across the pool: `/?add-to-cart=<id>` sets the cookies
+correctly but `/wp-json/wc/store/v1/cart` returns an empty cart.
+
+Drop the bundled workaround mu-plugin into your site to fix it:
+
+```bash
+cp vendor/ephpm/wordpress-worker/muplugins/woocommerce-session-per-request.php \
+   wp-content/mu-plugins/
+```
+
+It re-reads `$_COOKIE` into `WC()->session` at the start of every `wp_loaded`
+re-fire, so per-request cart state works correctly. The plugin lives in the
+adapter package (not the adapter itself) because it is WooCommerce-specific —
+the adapter should not know about individual plugins.
 
 ## Object cache
 

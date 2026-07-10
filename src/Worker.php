@@ -93,6 +93,51 @@ final class Worker
     ];
 
     /**
+     * WordPress actions that are part of the per-request lifecycle in classic
+     * FPM (fire on EVERY request against the freshly-populated `$_GET` /
+     * `$_COOKIE` / `$_POST`), but which `wp-settings.php` fires only ONCE per
+     * PHP process at boot. The persistent-worker adapter re-fires these before
+     * each `wp()` dispatch so plugin handlers registered on them (e.g.
+     * `WC_Form_Handler::add_to_cart_action()` on `wp_loaded`) run per request
+     * against the current request's superglobals, matching FPM semantics.
+     *
+     * SISTER LIST: {@see SHUTDOWN_ACTIONS} — the actions we fire AFTER the
+     * request has rendered (`shutdown`, WC session save happens here). See
+     * {@see fireShutdownActions()}.
+     *
+     * NOT included on purpose (each is documented boot-once, not per-request):
+     *   - `muplugins_loaded`, `plugins_loaded`: name and contract are "the
+     *     plugin has loaded", one-shot per process.
+     *   - `setup_theme`, `after_setup_theme`: theme file inclusion; one-shot.
+     *   - `set_current_user`: user-derivation; the adapter doesn't currently
+     *     re-derive the WP current user per request (auth-cookie based).
+     *   - `widgets_init`: hooked onto `init` at priority 1 by WP core; runs
+     *     when `init` re-fires, so re-firing it explicitly here would
+     *     double-fire it.
+     *
+     * @var list<string>
+     */
+    public const LIFECYCLE_ACTIONS = ['init', 'wp_loaded'];
+
+    /**
+     * WordPress actions that fire at request-end in classic FPM as part of
+     * PHP's script-end tear-down (`register_shutdown_function` → WordPress'
+     * `shutdown_action_hook()`), but which never fire in a persistent worker
+     * because the script never ends. Fired per iteration AFTER the response
+     * has been sent so plugin cleanup / persistence hooks run per request.
+     *
+     * Most visibly, `WC_Session_Handler::save_data()` is hooked on `shutdown`
+     * (via WooCommerce's session boot). Without re-firing shutdown per
+     * iteration, guest cart state is never persisted to the
+     * `wp_woocommerce_sessions` table — so `GET /wp-json/wc/store/v1/cart`
+     * always returns an empty guest cart even after `/?add-to-cart=<id>`
+     * successfully set the session cookie.
+     *
+     * @var list<string>
+     */
+    public const SHUTDOWN_ACTIONS = ['shutdown'];
+
+    /**
      * @param string $absPath absolute path to the WordPress root (ABSPATH),
      *                        with a trailing slash
      */
@@ -414,6 +459,99 @@ final class Worker
 
         // php://input parity: expose the raw body for REST/plugins that read it.
         $GLOBALS['EPHPM_WP_RAW_BODY'] = $rawBody;
+    }
+
+    /**
+     * Zero out the `did_action()` counters for the actions listed in
+     * {@see LIFECYCLE_ACTIONS} so that each subsequent per-request re-fire
+     * produces the FPM-parity counter progression (`did_action('init')` reads
+     * `1` inside the first request, `2` inside the second, and so on) rather
+     * than the boot-plus-request skew (`2, 3, …`).
+     *
+     * Call ONCE, from the entry script's global scope, immediately AFTER
+     * `wp-load.php` has returned and BEFORE the first request iteration —
+     * before entering the request loop. Idempotent.
+     *
+     * Only zeroes the counters for actions that will be re-fired per request.
+     * Other actions (`plugins_loaded`, `after_setup_theme`, …) are untouched
+     * so plugin code that reads `did_action('plugins_loaded')` still sees `1`
+     * after boot.
+     */
+    public static function resetBootActionCounters(): void
+    {
+        /** @var array<string, int>|null $counters */
+        $counters = $GLOBALS['wp_actions'] ?? null;
+        if (!\is_array($counters)) {
+            return;
+        }
+        foreach (self::LIFECYCLE_ACTIONS as $action) {
+            if (isset($counters[$action])) {
+                $GLOBALS['wp_actions'][$action] = 0;
+            }
+        }
+    }
+
+    /**
+     * Re-fire the per-request WordPress action lifecycle against the current
+     * request's superglobals.
+     *
+     * FPM semantics: `wp-settings.php` (which is where `init` and `wp_loaded`
+     * fire) runs on every request, against the freshly-populated `$_GET` /
+     * `$_COOKIE` / `$_POST`. Worker mode boots `wp-settings.php` ONCE, so
+     * without this method those actions only see the boot-time superglobals
+     * (empty). That silently breaks any plugin whose handler on `init` /
+     * `wp_loaded` reads a superglobal — most visibly WooCommerce's
+     * `WC_Form_Handler::add_to_cart_action()` on `wp_loaded`, which turns
+     * `GET /?add-to-cart=<id>` into a no-op.
+     *
+     * MUST be called from the entry script's GLOBAL scope, AFTER
+     * {@see beforeRequest()} has populated the superglobals + reset the loop
+     * globals, and BEFORE `wp()` / the entry script `require`. Runs at global
+     * scope so any hook body that uses top-level variables (`global $wpdb;` is
+     * routine) resolves correctly.
+     *
+     * @see LIFECYCLE_ACTIONS for the exact list of actions and rationale.
+     */
+    public static function runRequestLifecycle(): void
+    {
+        if (!\function_exists('do_action')) {
+            return;
+        }
+        foreach (self::LIFECYCLE_ACTIONS as $action) {
+            \do_action($action);
+        }
+    }
+
+    /**
+     * Fire the per-request WordPress SHUTDOWN action sequence — the actions
+     * WordPress normally fires from `shutdown_action_hook()` via PHP's
+     * `register_shutdown_function()` at script end. Under a resident worker
+     * the script never ends, so `shutdown` never fires and every hook
+     * registered on it accumulates work that never runs.
+     *
+     * MUST be called from the entry script's GLOBAL scope, AFTER the response
+     * has been dispatched (`send_response()`), so hook bodies (e.g. WC's
+     * session save) see the final per-request state. Errors thrown by
+     * shutdown hooks are logged but MUST NOT abort the worker — one broken
+     * plugin should not take down the pool.
+     *
+     * @see SHUTDOWN_ACTIONS for the exact list of actions and rationale.
+     */
+    public static function fireShutdownActions(): void
+    {
+        if (!\function_exists('do_action')) {
+            return;
+        }
+        foreach (self::SHUTDOWN_ACTIONS as $action) {
+            try {
+                \do_action($action);
+            } catch (\Throwable $e) {
+                \error_log(
+                    '[ephpm/wordpress-worker] shutdown hook (' . $action . ') threw: '
+                    . $e::class . ': ' . $e->getMessage(),
+                );
+            }
+        }
     }
 
     /**

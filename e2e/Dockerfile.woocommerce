@@ -1,0 +1,90 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# E2E image: WordPress + WooCommerce under the ephpm worker adapter.
+#
+# Regression harness for the "boot-once actions never re-fire" bug: WooCommerce
+# registers WC_Form_Handler::add_to_cart_action() on `wp_loaded`. Under classic
+# FPM that hook fires per request against the request's $_GET, so
+# GET /?add-to-cart=<id> adds the product to the cart. Under a naive persistent
+# worker, wp_loaded only fires once at boot (against empty $_GET) and the
+# request is a silent no-op. Worker::runRequestLifecycle() re-fires the
+# per-request action lifecycle so it works.
+#
+# See run-woocommerce.sh for the actual test.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── Stage 1: build the WordPress + WooCommerce tree ──────────────────────────
+FROM composer:2 AS wpbuild
+
+RUN apk add --no-cache curl tar bash unzip
+
+ARG WP_VERSION=6.7.1
+ARG WC_VERSION=9.4.3
+
+# 1. WordPress core.
+WORKDIR /var/www
+RUN curl -fsSL "https://wordpress.org/wordpress-${WP_VERSION}.tar.gz" -o wp.tgz \
+    && mkdir -p /var/www/html /var/www/db \
+    && tar -xzf wp.tgz --strip-components=1 -C /var/www/html \
+    && rm wp.tgz \
+    && mkdir -p /var/www/html/wp-content/mu-plugins /var/www/html/wp-content/plugins \
+    && test -f /var/www/html/wp-load.php
+
+# 2. wp-sqlite-db SQLite drop-in.
+RUN curl -fsSL "https://raw.githubusercontent.com/aaemnnosttv/wp-sqlite-db/master/src/db.php" \
+        -o /var/www/html/wp-content/db.php
+
+# 3. WooCommerce core.
+RUN curl -fsSL "https://downloads.wordpress.org/plugin/woocommerce.${WC_VERSION}.zip" -o wc.zip \
+    && unzip -q wc.zip -d /var/www/html/wp-content/plugins/ \
+    && rm wc.zip \
+    && test -f /var/www/html/wp-content/plugins/woocommerce/woocommerce.php
+
+# 4. Install ephpm/wordpress-worker via composer path repo.
+COPY pkgsrc/ /pkg/
+WORKDIR /app
+RUN cat > composer.json <<'JSON'
+{
+    "name": "ephpm/wordpress-worker-woocommerce-e2e",
+    "require": { "ephpm/wordpress-worker": "*" },
+    "minimum-stability": "dev",
+    "prefer-stable": true,
+    "repositories": [
+        { "type": "path", "url": "/pkg", "options": { "symlink": false } },
+        { "type": "vcs", "url": "https://github.com/ephpm/php-worker" }
+    ]
+}
+JSON
+RUN composer install --no-interaction --no-dev
+
+# 5. Config + entrypoints (shared with the golden-path e2e).
+COPY wp-config.php /var/www/html/wp-config.php
+COPY worker.php   /var/www/html/worker.php
+COPY classic-theme/ /var/www/html/wp-content/themes/ephpm-e2e-classic/
+
+# 5b. Install the WC-specific mu-plugin workaround (see the adapter README).
+# Without this, WC's session_handler singleton stays boot-time and guest carts
+# don't persist across the worker pool.
+RUN cp /app/vendor/ephpm/wordpress-worker/muplugins/woocommerce-session-per-request.php \
+       /var/www/html/wp-content/mu-plugins/
+
+# 6. Run headless install (WP core), then WC install + product creation.
+COPY install.php               /app/install.php
+COPY install-woocommerce.php   /app/install-woocommerce.php
+RUN EPHPM_WP_PATH=/var/www/html php /app/install.php \
+    && EPHPM_WP_PATH=/var/www/html php /app/install-woocommerce.php \
+       | tee /var/www/db/wc-install.out \
+    && grep -q '^WC_PRODUCT_ID=' /var/www/db/wc-install.out
+
+# ── Stage 2: ephpm runtime in worker mode ────────────────────────────────────
+FROM localhost/ephpm:worker-main AS runtime
+
+COPY --from=wpbuild /var/www /var/www
+COPY --from=wpbuild /app/vendor /app/vendor
+
+COPY app.toml /etc/ephpm/app.toml
+
+ENV EPHPM_WP_PATH=/var/www/html
+
+EXPOSE 8080
+
+CMD ["ephpm", "serve", "--config", "/etc/ephpm/app.toml"]

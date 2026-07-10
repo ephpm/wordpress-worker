@@ -5,3 +5,12 @@ composer.lock
 /e2e/.build/
 # run.sh regenerates this from the package source at build time.
 /e2e/pkgsrc/
+# The WC e2e drops the probe mu-plugin into a mount dir alongside pkgsrc; the
+# probe file itself is checked in but the WC-workaround copy (staged from
+# /muplugins) is not.
+/e2e/pkgsrc-muplugins/woocommerce-session-per-request.php
+# Scratch output from the e2e runners (cookie jars, run logs, curl traces).
+/e2e/*.jar
+/e2e/*.log
+/e2e/curl.log
+/e2e/atc-debug.log
