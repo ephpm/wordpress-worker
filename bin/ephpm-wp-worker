@@ -101,10 +101,21 @@ require $__abs . 'wp-load.php';
 $__ephpmWorker = new Worker($__abs);
 $__ephpmWorker->installHooks();
 
+// Zero the boot-time did_action() counters for actions this loop re-fires per
+// request (init, wp_loaded), so `did_action('init')` reads 1 inside the first
+// request just like it does in FPM. See Worker::resetBootActionCounters().
+Worker::resetBootActionCounters();
+
 while (($__env = \Ephpm\Worker\take_request()) !== null) {
     ob_start();
     try {
         $__target = $__ephpmWorker->beforeRequest($__env);
+        // Re-fire the per-request WordPress action lifecycle (init, wp_loaded)
+        // against THIS request's superglobals. Without this, plugin handlers
+        // registered on those actions — e.g. WooCommerce's add-to-cart form
+        // handler on wp_loaded — only see the boot-time (empty) $_GET, and the
+        // request is silently a no-op. See Worker::runRequestLifecycle().
+        Worker::runRequestLifecycle();
         if ($__target !== null) {
             // A concrete entry script (wp-login.php, wp-admin/*, ...). It re-uses
             // the resident WordPress and typically exit()s at the end; the engine
@@ -138,6 +149,12 @@ while (($__env = \Ephpm\Worker\take_request()) !== null) {
         [$__st, $__hd, $__body] = Worker::errorResponseTriple($__e);
         \Ephpm\Worker\send_response($__st, $__hd, $__body);
     } finally {
+        // Fire WordPress' `shutdown` action per iteration (FPM fires this from
+        // PHP's register_shutdown_function at script end; worker mode's script
+        // never ends). WooCommerce's session save is hooked on `shutdown` —
+        // without this, guest cart state never lands in wp_woocommerce_sessions
+        // and the Store API keeps returning empty carts.
+        Worker::fireShutdownActions();
         // Unlink the upload temp files spooled for this request AFTER the
         // response was sent — a persistent worker would accumulate them forever.
         Worker::cleanupSpooledFiles();

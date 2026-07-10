@@ -37,10 +37,22 @@ if (function_exists('remove_action')) {
     remove_action('template_redirect', 'redirect_canonical');
 }
 
+// Zero boot-time did_action() counters for the actions re-fired per request
+// (init, wp_loaded), matching FPM's per-request counter progression. See
+// Worker::resetBootActionCounters().
+Worker::resetBootActionCounters();
+
 while (($env = \Ephpm\Worker\take_request()) !== null) {
     ob_start();
     try {
         $target = $ephpmWorker->beforeRequest($env);
+        // Re-fire the WordPress per-request action lifecycle (init, wp_loaded)
+        // against THIS request's superglobals. Required so plugin handlers
+        // registered on those actions — most visibly WooCommerce's add-to-cart
+        // form handler on wp_loaded — see the current request's $_GET/$_POST
+        // rather than the boot-time (empty) values. See
+        // Worker::runRequestLifecycle().
+        Worker::runRequestLifecycle();
         if ($target !== null) {
             require $target;
         } else {
@@ -68,6 +80,10 @@ while (($env = \Ephpm\Worker\take_request()) !== null) {
         [$st, $hd, $body] = Worker::errorResponseTriple($e);
         \Ephpm\Worker\send_response($st, $hd, $body);
     } finally {
+        // Fire WordPress' `shutdown` action per iteration (FPM fires this from
+        // PHP's register_shutdown_function at script end; worker mode's script
+        // never ends). WooCommerce's session save is hooked on shutdown.
+        Worker::fireShutdownActions();
         // Unlink the upload temp files spooled for this request AFTER the
         // response was sent — a persistent worker would accumulate them forever.
         Worker::cleanupSpooledFiles();
