@@ -198,6 +198,37 @@ re-fire, so per-request cart state works correctly. The plugin lives in the
 adapter package (not the adapter itself) because it is WooCommerce-specific —
 the adapter should not know about individual plugins.
 
+## Running Elementor
+
+Elementor's `Plugin::init()` handler (registered on `init` at priority 0)
+`include`s its element class files (`elements/base.php`, `elements/section.php`,
+`elements/column.php`, …) via `Elements_Manager::init_elements()`. Under
+classic PHP-FPM `init` fires once per process, so these run once — correct.
+Under this adapter's per-request `init` re-fire, the second request re-runs
+the include and crashes the worker with:
+
+```
+PHP Fatal error: Cannot redeclare class Elementor\Element_Column
+.../wp-content/plugins/elementor/includes/elements/column.php:19
+```
+
+Elementor's Plugin singleton and element registry are already fully populated
+by boot-time; the per-request replay of Elementor's `init` handler adds no
+functional value and only re-triggers the include. The bundled mu-plugin
+strips the `init`-priority-0 binding of `Plugin::init` after boot so the
+replay skips it. All other Elementor hooks (REST, admin, editor, widget
+render) stay intact.
+
+Drop it into your site alongside the WooCommerce one:
+
+```bash
+cp vendor/ephpm/wordpress-worker/muplugins/elementor-idempotent-lifecycle.php \
+   wp-content/mu-plugins/
+```
+
+Same rationale as the WooCommerce mu-plugin: plugin-specific workaround, so
+it lives in this package's `muplugins/` rather than in the adapter itself.
+
 ## Object cache
 
 For a persistent object cache across requests, install the existing
