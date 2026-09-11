@@ -5,10 +5,12 @@ document_root = "/var/www/html"        # the WordPress root (ABSPATH)
 
 [php]
 mode = "worker"
-worker_script = "worker.php"
-worker_populate_superglobals = true   # REQUIRED for WordPress
-worker_count = 3                       # a few workers so exit-based routes
-                                       # (wp-login/REST end in exit -> recycle)
-                                       # don't starve the pool
-worker_max_requests = 2000
-worker_boot_timeout = 120              # generous boot window for WordPress
+concurrency = 3                        # worker-thread pool size — a few workers so
+                                       # exit-based routes (wp-login/REST end in
+                                       # exit -> recycle) don't starve the pool
+
+[php.worker]
+script = "worker.php"
+populate_superglobals = true           # REQUIRED for WordPress
+max_requests = 2000
+boot_timeout = 120                     # generous boot window for WordPress

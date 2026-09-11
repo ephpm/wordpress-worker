@@ -172,6 +172,37 @@ final class BodyParseTest extends TestCase
         self::assertSame(['1', '2'], $post['cats']);
     }
 
+    public function testMultipartArrayOfFilesPivotsToPhpFilesShape(): void
+    {
+        // Two files under one name="photos[]" field plus a scalar name="avatar".
+        // PHP builds the pivoted $_FILES shape: the five attributes are lifted
+        // above the [] index, so BOTH files survive instead of the second
+        // last-winning under the literal key "photos[]".
+        $boundary = 'B';
+        $body = self::multipart($boundary, [
+            ['name' => 'photos[]', 'filename' => 'a.jpg', 'ctype' => 'image/jpeg', 'value' => 'AAA'],
+            ['name' => 'photos[]', 'filename' => 'b.jpg', 'ctype' => 'image/jpeg', 'value' => 'BBBB'],
+            ['name' => 'avatar', 'filename' => 'me.png', 'ctype' => 'image/png', 'value' => 'PNG'],
+        ]);
+
+        [, $files] = Worker::parseBody('POST', "multipart/form-data; boundary={$boundary}", $body, self::env());
+
+        // Bracketed field: pivoted parallel arrays, index-aligned across attributes.
+        self::assertSame(['a.jpg', 'b.jpg'], $files['photos']['name']);
+        self::assertSame(['image/jpeg', 'image/jpeg'], $files['photos']['type']);
+        self::assertSame([3, 4], $files['photos']['size']);
+        self::assertSame([\UPLOAD_ERR_OK, \UPLOAD_ERR_OK], $files['photos']['error']);
+        self::assertCount(2, $files['photos']['tmp_name']);
+        self::assertSame('AAA', \file_get_contents($files['photos']['tmp_name'][0]));
+        self::assertSame('BBBB', \file_get_contents($files['photos']['tmp_name'][1]));
+
+        // Scalar field: classic single-file shape (unchanged).
+        self::assertSame('me.png', $files['avatar']['name']);
+        self::assertIsString($files['avatar']['tmp_name']);
+
+        Worker::cleanupSpooledFiles();
+    }
+
     /**
      * Build a multipart/form-data body from a list of parts.
      *

@@ -33,8 +33,8 @@ use Throwable;
  * EMPIRICAL engine behaviour this adapter is built around (observed in the e2e
  * harness against a real ePHPm worker build — these CORRECT some of the
  * originally-assumed facts):
- *   - With `worker_populate_superglobals = true` the engine natively populates
- *     `$_GET` and `$_COOKIE`, but leaves `$_SERVER` essentially EMPTY (no
+ *   - With `[php.worker] populate_superglobals = true` the engine natively
+ *     populates `$_GET` and `$_COOKIE`, but leaves `$_SERVER` essentially EMPTY (no
  *     `REQUEST_URI`/`REQUEST_METHOD`/`HTTP_HOST`). So this adapter populates
  *     `$_SERVER` from the Envelope itself, and MUST NOT reassign `$_GET`/
  *     `$_COOKIE` — replacing the engine-owned superglobal zvals crashes the
@@ -71,6 +71,15 @@ final class Worker
      * {@see resetRequestGlobals()}. Kept as a named constant so the exact
      * key-list is directly unit-testable and reviewable.
      *
+     * SECURITY: the current-user identity globals are in this list. A logged-in
+     * request sets `$current_user` (and the legacy `$user_ID`/`$userdata`/…
+     * globals `setup_userdata()` writes) on the resident worker; if they are not
+     * cleared, the NEXT — possibly anonymous — request served by the same worker
+     * inherits the previous visitor's identity. Unsetting `$current_user` forces
+     * WordPress to re-derive the user from THIS request's engine-fresh
+     * `$_COOKIE` on the next `wp_get_current_user()` call (which re-runs the
+     * `determine_current_user` filter and re-fires `set_current_user`).
+     *
      * @var list<string>
      */
     public const RESET_GLOBALS = [
@@ -90,6 +99,17 @@ final class Worker
         'pagenow',
         'typenow',
         'taxnow',
+        // Current-user identity (SECURITY: must not leak request-to-request).
+        // `$current_user` is the load-bearing one WordPress re-derives from the
+        // auth cookie; the rest are the legacy globals `setup_userdata()` writes.
+        'current_user',
+        'user_ID',
+        'userdata',
+        'user_login',
+        'user_email',
+        'user_url',
+        'user_identity',
+        'user_level',
     ];
 
     /**
@@ -144,6 +164,17 @@ final class Worker
     public function __construct(private readonly string $absPath)
     {
     }
+
+    /**
+     * The `$_SERVER` keys this adapter set from the previous request's Envelope,
+     * so {@see marshalSuperglobals()} can unset the ones the next request does
+     * not re-supply (stale HTTP_AUTHORIZATION / CONTENT_* / HTTP_X_* bleed).
+     * Static because a resident worker services one request at a time and the
+     * loop lives in the entry script, not on a single Worker instance.
+     *
+     * @var list<string>
+     */
+    private static array $marshaledServerKeys = [];
 
     /**
      * Define the constants WordPress needs for a headless worker boot.
@@ -436,12 +467,30 @@ final class Worker
         $server = $envelope->serverVars();
         $rawBody = (string) $envelope->rawBody();
 
+        // Remove the $_SERVER keys THIS adapter set from a PRIOR request's
+        // Envelope that the current request does not re-supply. Without this,
+        // per-request server vars — most dangerously HTTP_AUTHORIZATION, but also
+        // CONTENT_TYPE / CONTENT_LENGTH and any HTTP_X_* header — bleed from an
+        // earlier request into a later one that omits them, because the engine
+        // leaves $_SERVER for the adapter to own and we only ever assigned keys.
+        // Engine-owned / adapter-later keys (e.g. SCRIPT_NAME set in
+        // beforeRequest()) are never in this tracked set, so they are untouched.
+        foreach (self::$marshaledServerKeys as $prevKey) {
+            if (!\array_key_exists($prevKey, $server)) {
+                unset($_SERVER[$prevKey]);
+            }
+        }
+
         // Populate $_SERVER from the Envelope (engine leaves it empty). Assigning
         // individual keys (rather than replacing the whole array) avoids
-        // disturbing any engine-owned $_SERVER entries.
+        // disturbing any engine-owned $_SERVER entries. Track exactly the keys we
+        // set so the next request can retire the ones it does not re-supply.
+        $marshaled = [];
         foreach ($server as $k => $v) {
             $_SERVER[$k] = $v;
+            $marshaled[] = $k;
         }
+        self::$marshaledServerKeys = $marshaled;
 
         $contentType = self::headerValue($server, 'CONTENT_TYPE');
         $method = \strtoupper((string) ($server['REQUEST_METHOD'] ?? ($_SERVER['REQUEST_METHOD'] ?? 'GET')));
@@ -559,7 +608,11 @@ final class Worker
      *
      * Two-part reset:
      *   1. Unset the transient loop/template globals in {@see RESET_GLOBALS} —
-     *      WordPress re-derives them during the template stack.
+     *      WordPress re-derives them during the template stack. This includes
+     *      the current-user identity globals (`$current_user`, `$user_ID`, …):
+     *      clearing them makes WordPress re-derive the user from this request's
+     *      engine-fresh `$_COOKIE`, so a logged-in request never leaks its
+     *      identity onto the next visitor served by the same worker (SECURITY).
      *   2. Re-instantiate the query objects (`$wp_query`, `$wp_the_query`) as
      *      fresh `WP_Query` instances and reset the `$wp` router's per-request
      *      fields IN PLACE (not unset — `wp()` calls `$wp->main()` on it).
@@ -831,6 +884,14 @@ final class Worker
      * Spool one uploaded file to a temp path and register it in `$files`
      * in `$_FILES` shape.
      *
+     * A bracketed field name (`photos[]`, `docs[main]`, …) is placed in PHP's
+     * pivoted `$_FILES` shape — the five per-file attributes are lifted ABOVE the
+     * bracket path, so `name="photos[]"` yields `$_FILES['photos']['name'][0]`,
+     * `['tmp_name'][0]`, … and a second `photos[]` part appends index `1` (rather
+     * than the old last-wins collapse under the literal key `"photos[]"`, which
+     * broke WordPress' Media Library "add multiple files" and any `name="x[]"`
+     * upload). A plain name keeps the scalar `$_FILES['photo']['name']` shape.
+     *
      * @param array<string, mixed> $files
      */
     private static function assignFile(
@@ -854,13 +915,94 @@ final class Worker
             }
         }
 
-        $files[$name] = [
+        $spec = [
             'name' => $filename,
             'type' => $type,
             'tmp_name' => $tmp,
             'error' => $error,
             'size' => \strlen($content),
         ];
+
+        [$base, $path] = self::splitFieldName($name);
+
+        if ($path === []) {
+            // Plain field name: the classic single-file $_FILES[base][attr] shape.
+            foreach ($spec as $attr => $value) {
+                $files[$base][$attr] = $value;
+            }
+
+            return;
+        }
+
+        // Bracketed name: PHP pivots the attributes above the bracket path, so
+        // each attribute array mirrors the field's structure. `[]` appends.
+        foreach ($spec as $attr => $value) {
+            if (!isset($files[$base]) || !\is_array($files[$base])) {
+                $files[$base] = [];
+            }
+            if (!isset($files[$base][$attr]) || !\is_array($files[$base][$attr])) {
+                $files[$base][$attr] = [];
+            }
+            self::assignByPath($files[$base][$attr], $path, $value);
+        }
+    }
+
+    /**
+     * Split a form field name into its base and bracket path:
+     * `photos[]` → `['photos', ['']]`, `docs[a][b]` → `['docs', ['a', 'b']]`,
+     * `photo` → `['photo', []]`. An empty path segment (`''`) means append.
+     *
+     * @return array{0: string, 1: list<string>}
+     */
+    private static function splitFieldName(string $name): array
+    {
+        $pos = \strpos($name, '[');
+        if ($pos === false) {
+            return [$name, []];
+        }
+
+        $path = [];
+        if (\preg_match_all('/\[([^\]]*)\]/', \substr($name, $pos), $m) !== false) {
+            $path = $m[1];
+        }
+
+        return [\substr($name, 0, $pos), $path];
+    }
+
+    /**
+     * Assign `$value` into `$target` following a bracket `$path`. An empty
+     * segment (`''`) appends at the next integer index, matching PHP's `name[]`.
+     *
+     * @param array<array-key, mixed> $target
+     * @param list<string>            $path
+     */
+    private static function assignByPath(array &$target, array $path, mixed $value): void
+    {
+        $ref = &$target;
+        $last = \count($path) - 1;
+        foreach ($path as $i => $segment) {
+            if ($segment === '') {
+                if ($i === $last) {
+                    $ref[] = $value;
+
+                    return;
+                }
+                $ref[] = [];
+                $ref = &$ref[\array_key_last($ref)];
+
+                continue;
+            }
+
+            if ($i === $last) {
+                $ref[$segment] = $value;
+
+                return;
+            }
+            if (!isset($ref[$segment]) || !\is_array($ref[$segment])) {
+                $ref[$segment] = [];
+            }
+            $ref = &$ref[$segment];
+        }
     }
 
     /**

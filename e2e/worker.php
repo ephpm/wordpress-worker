@@ -4,7 +4,7 @@ declare(strict_types=1);
 
 /**
  * Worker entrypoint for the e2e image. Lives under document_root
- * (/var/www/html) so ephpm's worker_script validation accepts it.
+ * (/var/www/html) so ephpm's [php.worker] script validation accepts it.
  *
  * WordPress is booted ONCE at GLOBAL scope (a top-level require, not inside a
  * function), and the request loop also runs at global scope — wp() + the
