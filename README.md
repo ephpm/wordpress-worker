@@ -61,6 +61,14 @@ inclusion, not request handling. Handlers on them typically do class wiring,
 translation loading, or user-derivation — safe to run once. Re-firing would
 double-fire class-wiring code with no request-scoped upside.
 
+The **current user** is handled differently, though: the per-request reset
+*unsets* `$current_user` (and the legacy `$user_ID`/`$userdata`/… identity
+globals — see `Worker::RESET_GLOBALS`), so the next `wp_get_current_user()`
+re-derives the user from **this** request's engine-fresh `$_COOKIE` and re-fires
+`set_current_user` lazily. Without that reset a logged-in request would pin its
+identity onto the resident worker and the next anonymous visitor would be seen
+as that user — a cross-request identity leak.
+
 **Why fire `shutdown` per iteration?** In classic FPM, `shutdown` fires when
 PHP tears the script down at request end (via
 `register_shutdown_function` → WordPress' `shutdown_action_hook()`). In
@@ -91,8 +99,8 @@ broken plugin should not take down the worker pool.
   `register_post_type(…)` inside its own `init` body will register a fresh
   callback / a fresh post-type on every request, growing `$wp_filter` /
   `$wp_post_types` unboundedly. Well-behaved plugins register hooks at
-  plugin-load time (or self-gate with a static flag); the `worker_max_requests`
-  ceiling bounds the blast radius for the ones that don't.
+  plugin-load time (or self-gate with a static flag); the `[php.worker]
+  max_requests` ceiling bounds the blast radius for the ones that don't.
 - **Handlers on `shutdown` that call `exit`.** Under FPM, `shutdown` fires
   from PHP's tear-down and any `exit`/`die` inside a handler is harmless
   (the script was ending anyway). Under the worker, an `exit` inside a
@@ -111,7 +119,7 @@ broken plugin should not take down the worker pool.
 ## Requirements
 
 - ePHPm built with worker mode (`[php] mode = "worker"`).
-- **`worker_populate_superglobals = true`** — WordPress assumes real
+- **`[php.worker] populate_superglobals = true`** — WordPress assumes real
   `$_SERVER/$_GET/$_COOKIE` superglobals. This is **not** the default; you must
   turn it on. Without it, WordPress routing and `$wpdb`-driven queries misbehave.
 
@@ -153,11 +161,20 @@ document_root = "/var/www/html"         # the WordPress root (ABSPATH)
 
 [php]
 mode = "worker"
-worker_script = "worker.php"            # your loop; see below
-worker_populate_superglobals = true     # REQUIRED for WordPress
-worker_count = 4                         # WordPress ~40 MB/worker — size accordingly
-worker_max_requests = 500                # recycle to reclaim slow memory growth
+concurrency = 4                          # worker-thread pool size — WordPress ~40 MB/worker, size accordingly (0 = auto)
+
+[php.worker]
+script = "worker.php"                    # your loop; see below
+populate_superglobals = true             # REQUIRED for WordPress
+max_requests = 500                       # recycle to reclaim slow memory growth
 ```
+
+The worker knobs live in the `[php.worker]` table (`script`, `max_requests`,
+`boot_timeout`, `populate_superglobals`, `stream_threshold`); pool sizing is the
+whole-server `[php] concurrency` knob. The old flat `worker_*` keys
+(`worker_script`, `worker_count`, `worker_populate_superglobals`,
+`worker_max_requests`, `worker_boot_timeout`) were removed and are now a **hard
+startup error** — migrate any existing config.
 
 Set `EPHPM_WP_PATH` to the WordPress root (defaults to `document_root` via the
 `wp-load.php` walk if omitted):
@@ -166,15 +183,12 @@ Set `EPHPM_WP_PATH` to the WordPress root (defaults to `document_root` via the
 EPHPM_WP_PATH=/var/www/html
 ```
 
-Your `worker.php` (pointed to by `worker_script`) is a one-liner:
-
-```php
-<?php
-require __DIR__ . '/vendor/autoload.php';
-exit((new Ephpm\WordPress\Worker(getenv('EPHPM_WP_PATH') . '/'))->run());
-```
-
-or just use the bundled `bin/ephpm-wp-worker` as your `worker_script`.
+WordPress' request cycle must run at **global scope**, so this adapter does not
+expose a `run()` method — the request loop lives in the worker entry script. Use
+the bundled `bin/ephpm-wp-worker` as your `[php.worker] script` (it boots
+WordPress once and runs the loop), or copy it into your project as `worker.php`
+and point the config at your copy. See `bin/ephpm-wp-worker` for the canonical
+global-scope loop.
 
 ## Running WooCommerce
 
@@ -271,7 +285,7 @@ before shipping:
   global not on the list, or a **dynamically-registered hook** will leak across
   requests within a worker. (The bundled mu-plugin demonstrates the hook-leak
   trap and how to avoid it — register filters once, self-gate per request.)
-  Recycling (`worker_max_requests`) bounds the blast radius.
+  Recycling (`[php.worker] max_requests`) bounds the blast radius.
 - **`$_SERVER` is populated by this adapter.** The engine populates `$_GET` /
   `$_COOKIE` natively but leaves `$_SERVER` empty in worker mode, so the adapter
   fills `$_SERVER` (REQUEST_URI/HTTP_HOST/…) from the Envelope. It deliberately
@@ -287,7 +301,7 @@ before shipping:
 - **Fatals recycle the worker.** An uncatchable fatal in a hook takes down the
   worker; ePHPm respawns it and serves the next request from a clean boot. A
   single request's fatal never serves stale state, but costs one worker boot.
-  Run enough workers (`worker_count`) that recycling doesn't starve the pool.
+  Run enough workers (`[php] concurrency`) that recycling doesn't starve the pool.
 
 ## Testing
 

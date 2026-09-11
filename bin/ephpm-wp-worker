@@ -7,14 +7,14 @@ declare(strict_types=1);
  * ephpm-wp-worker — WordPress entrypoint for ePHPm persistent worker mode.
  *
  * ePHPm launches this script for each persistent worker (point
- * `[php] worker_script` at it, or at a copy of it inside your project). It:
+ * `[php.worker] script` at it, or at a copy of it inside your project). It:
  *
  *   1. locates and loads this package's Composer autoloader,
  *   2. locates the WordPress root (EPHPM_WP_PATH env var, or ABSPATH if already
  *      defined, or a walk upward looking for wp-load.php),
  *   3. boots WordPress ONCE and runs the worker loop via Ephpm\WordPress\Worker.
  *
- * Requires `[php] worker_populate_superglobals = true` in ephpm.toml — WordPress
+ * Requires `[php.worker] populate_superglobals = true` in ephpm.toml — WordPress
  * assumes real $_SERVER/$_GET/$_COOKIE superglobals. See the package README.
  */
 

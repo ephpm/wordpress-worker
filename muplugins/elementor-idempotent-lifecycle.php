@@ -38,7 +38,7 @@
  * SCOPE: this fixes the redeclaration fatal only. It does NOT audit the
  * remaining Elementor codepaths for per-request idempotency (e.g. widget-cache
  * clearing, breakpoint state, editor-preview flow). Ship together with a
- * conservative `worker_max_requests` and instrument for regressions.
+ * conservative `[php.worker] max_requests` and instrument for regressions.
  */
 
 add_action(

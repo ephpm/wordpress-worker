@@ -56,6 +56,41 @@ final class SuperglobalMarshalTest extends TestCase
         self::assertSame('POST', $_SERVER['REQUEST_METHOD']);
     }
 
+    public function testStaleServerKeysDoNotBleedAcrossRequests(): void
+    {
+        $worker = new Worker('/tmp/wp/');
+
+        // Request 1 carries an Authorization header, a request body content type,
+        // and a custom HTTP_X_* header.
+        $worker->marshalSuperglobals(new FakeEnvelope(
+            server: [
+                'REQUEST_METHOD' => 'POST',
+                'REQUEST_URI' => '/one',
+                'HTTP_AUTHORIZATION' => 'Bearer secret-token',
+                'CONTENT_TYPE' => 'application/json',
+                'CONTENT_LENGTH' => '17',
+                'HTTP_X_CUSTOM' => 'first',
+            ],
+            rawBody: '{"title":"hello"}',
+        ));
+        self::assertSame('Bearer secret-token', $_SERVER['HTTP_AUTHORIZATION']);
+        self::assertSame('application/json', $_SERVER['CONTENT_TYPE']);
+
+        // Request 2 is a plain GET that supplies NONE of those keys. They must be
+        // retired — a leftover HTTP_AUTHORIZATION would let one visitor's bearer
+        // token be seen by the next request served by the same worker.
+        $worker->marshalSuperglobals(new FakeEnvelope(
+            server: ['REQUEST_METHOD' => 'GET', 'REQUEST_URI' => '/two'],
+        ));
+
+        self::assertSame('/two', $_SERVER['REQUEST_URI']);
+        self::assertSame('GET', $_SERVER['REQUEST_METHOD']);
+        self::assertArrayNotHasKey('HTTP_AUTHORIZATION', $_SERVER);
+        self::assertArrayNotHasKey('CONTENT_TYPE', $_SERVER);
+        self::assertArrayNotHasKey('CONTENT_LENGTH', $_SERVER);
+        self::assertArrayNotHasKey('HTTP_X_CUSTOM', $_SERVER);
+    }
+
     public function testUrlencodedPostIsParsedIntoPost(): void
     {
         $worker = new Worker('/tmp/wp/');
